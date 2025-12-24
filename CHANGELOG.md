@@ -62,7 +62,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Updated README with competitive comparison table
 - Improved documentation structure with badges and better organization
-- Total security rules increased from ~74 to ~115 (55% increase)
+- Total security rules increased from ~74 to 111 (50% increase)
 
 ## [1.0.0] - 2025-12-23
 

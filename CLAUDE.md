@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-narsil-mcp is a Rust MCP (Model Context Protocol) server that provides comprehensive code intelligence capabilities to AI assistants. It indexes codebases using tree-sitter for multi-language parsing and exposes **75 tools** for:
+narsil-mcp is a Rust MCP (Model Context Protocol) server that provides comprehensive code intelligence capabilities to AI assistants. It indexes codebases using tree-sitter for multi-language parsing and exposes **76 tools** for:
 - Symbol search and code navigation
 - Multi-mode code search (BM25, TF-IDF, hybrid, neural)
 - Call graph analysis
@@ -110,7 +110,7 @@ stdio (JSON-RPC) → McpServer → CodeIntelEngine → LanguageParser (tree-sitt
 4. Symbols and file contents cached in concurrent `DashMap`s
 5. MCP tools query the indexes to serve requests
 
-## Supported Languages (13)
+## Supported Languages (14)
 
 | Language | Extensions | Symbol Types |
 |----------|------------|--------------|
@@ -129,7 +129,7 @@ stdio (JSON-RPC) → McpServer → CodeIntelEngine → LanguageParser (tree-sitt
 | Kotlin | `.kt`, `.kts` | functions, classes, objects, interfaces |
 | PHP | `.php`, `.phtml` | functions, methods, classes, interfaces, traits |
 
-## MCP Tools (74 total)
+## MCP Tools (76 total)
 
 **Important:** Tools use short parameter names. Use `repo` (not `repo_path`), `symbol` (not `symbol_name`), `path` (not `file_path`). The `repo` parameter expects the repository name from `list_repos`, not the full path.
 
@@ -247,12 +247,15 @@ stdio (JSON-RPC) → McpServer → CodeIntelEngine → LanguageParser (tree-sitt
 | `get_import_graph` | Build and analyze import dependency graph | `repo` |
 | `find_circular_imports` | Detect circular import dependencies | `repo` |
 
-### Graph Visualization (1 tool)
+### Experimental / AI-Assisted (2 tools)
 | Tool | Description | Required Params |
 |------|-------------|-----------------|
-| `get_code_graph` | Get unified JSON graph for visualization (call/import/symbol/hybrid/flow views) | `view` |
+| `explain_codebase` | Get AI-friendly codebase overview | `repo` |
+| `find_implementation` | Find where a feature is implemented | `repo`, `feature` |
 
 ## Visual Frontend
+
+**Note:** The `get_code_graph` tool is available via HTTP API only (not MCP), for the visualization frontend.
 
 A React-based visualization frontend is available in `frontend/`:
 

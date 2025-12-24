@@ -7,7 +7,7 @@
 [![Tests](https://img.shields.io/badge/tests-359%20passed-brightgreen.svg)](https://github.com/postrv/narsil-mcp)
 [![MCP](https://img.shields.io/badge/MCP-compatible-blue.svg)](https://modelcontextprotocol.io)
 
-A Rust-powered MCP (Model Context Protocol) server providing AI assistants with deep code understanding through 74 specialized tools.
+A Rust-powered MCP (Model Context Protocol) server providing AI assistants with deep code understanding through 76 specialized tools.
 
 ## Why narsil-mcp?
 
@@ -32,7 +32,7 @@ A Rust-powered MCP (Model Context Protocol) server providing AI assistants with 
 
 ### Why Choose narsil-mcp?
 
-- **Written in Rust** - Blazingly fast, memory-safe, single binary (~15MB)
+- **Written in Rust** - Blazingly fast, memory-safe, single binary (~30MB)
 - **Tree-sitter powered** - Accurate, incremental parsing for 14 languages
 - **Zero config** - Point at repos and go
 - **MCP compliant** - Works with Claude, Cursor, VS Code Copilot, and any MCP client
@@ -86,7 +86,7 @@ cargo build --release
 narsil-mcp supports different feature sets for different use cases:
 
 ```bash
-# Default build - native MCP server (~15MB)
+# Default build - native MCP server (~30MB)
 cargo build --release
 
 # With neural vector search (~18MB) - adds TF-IDF similarity
@@ -520,7 +520,7 @@ interface Stats {
 
 **Bundle Size:** ~2-3MB gzipped (includes tree-sitter parsers for all languages)
 
-## Available Tools (74)
+## Available Tools (76)
 
 ### Repository & File Management
 
@@ -876,7 +876,7 @@ This release marks production readiness with 359 tests, comprehensive benchmarks
 - **Parallel hybrid search** - BM25 + TF-IDF run concurrently via rayon
 - **WASM build** - Run in browser for code playgrounds and educational tools
 - **4 new languages** - Bash, Ruby, Kotlin, PHP support
-- **115 bundled security rules** - OWASP, CWE, crypto, secrets detection
+- **111 bundled security rules** - OWASP, CWE, crypto, secrets detection
 - **Security hardening** - Path traversal prevention, secret redaction, file size limits
 - **IDE configs included** - Claude Desktop, Cursor, VS Code templates
 
