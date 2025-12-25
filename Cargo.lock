@@ -1864,6 +1864,7 @@ dependencies = [
  "tree-sitter-swift",
  "tree-sitter-typescript",
  "tree-sitter-verilog",
+ "url",
  "usearch",
  "uuid",
  "walkdir",

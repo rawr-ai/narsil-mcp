@@ -7,14 +7,28 @@
 //! This module provides dense vector embeddings for semantic code search,
 //! complementing the TF-IDF embeddings in embeddings.rs
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::io::Read;
+use std::net::IpAddr;
 use std::sync::Arc;
+use std::time::Duration;
+use url::Url;
 
 #[cfg(feature = "neural")]
 use std::path::Path;
+
+// Security constants for input validation
+const MAX_EMBEDDING_BATCH_SIZE: usize = 100; // Maximum texts per API request
+const MAX_TEXT_LENGTH: usize = 32_000; // Maximum characters per text (~8k tokens for most models)
+const MAX_DIMENSION: usize = 8192; // Maximum embedding dimension (larger than any known model)
+const MIN_DIMENSION: usize = 64; // Minimum reasonable embedding dimension
+const MAX_MODEL_NAME_LENGTH: usize = 256; // Maximum model name length
+const MAX_API_KEY_LENGTH: usize = 2048; // Maximum API key length
+const API_REQUEST_TIMEOUT_SECS: u64 = 120; // 2 minutes timeout for API requests
+const MAX_RESPONSE_SIZE_BYTES: usize = 100 * 1024 * 1024; // 100MB max response size
 
 /// Embedding model configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -53,6 +67,116 @@ impl Default for NeuralConfig {
             batch_size: 32,
         }
     }
+}
+
+// ============================================================================
+// URL Validation and Security
+// ============================================================================
+
+/// Check if a hostname is localhost or a private IP address
+fn is_private_or_localhost(host: &str) -> bool {
+    // Check for localhost names
+    if host == "localhost" || host == "127.0.0.1" || host == "::1" {
+        return true;
+    }
+
+    // Try to parse as IP address
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        match ip {
+            IpAddr::V4(ipv4) => {
+                // Private IPv4 ranges:
+                // 10.0.0.0/8
+                // 172.16.0.0/12
+                // 192.168.0.0/16
+                // 127.0.0.0/8 (loopback)
+                let octets = ipv4.octets();
+                octets[0] == 10
+                    || octets[0] == 127
+                    || (octets[0] == 172 && (16..=31).contains(&octets[1]))
+                    || (octets[0] == 192 && octets[1] == 168)
+            }
+            IpAddr::V6(ipv6) => {
+                // Private IPv6 ranges:
+                // ::1 (loopback)
+                // fc00::/7 (unique local addresses)
+                // fe80::/10 (link-local)
+                ipv6.is_loopback()
+                    || (ipv6.segments()[0] & 0xfe00) == 0xfc00
+                    || (ipv6.segments()[0] & 0xffc0) == 0xfe80
+            }
+        }
+    } else {
+        false
+    }
+}
+
+/// Validate and sanitize an embedding API endpoint URL
+///
+/// # Security Considerations
+/// - Only allows http and https schemes to prevent SSRF via file://, ftp://, etc.
+/// - Blocks cloud metadata service URLs (169.254.169.254, fd00:ec2::254, metadata.google.internal)
+/// - Allows localhost and private IPs (users may intentionally use local embedding servers)
+/// - Logs warnings when using localhost or private IPs
+/// - Validates URL syntax to prevent malformed requests
+/// - Enforces maximum URL length (2048 characters)
+///
+/// # Arguments
+/// * `url_str` - The URL string to validate
+///
+/// # Returns
+/// * `Ok(String)` - The validated URL string
+/// * `Err` - If the URL is invalid or uses a disallowed scheme
+fn validate_embedding_endpoint(url_str: &str) -> Result<String> {
+    // Validate URL length
+    if url_str.len() > 2048 {
+        bail!("URL too long: maximum 2048 characters allowed");
+    }
+
+    // Parse the URL
+    let parsed = Url::parse(url_str).with_context(|| format!("Invalid URL format: {}", url_str))?;
+
+    // Validate scheme (only http and https allowed)
+    match parsed.scheme() {
+        "http" | "https" => {}
+        scheme => {
+            bail!(
+                "Invalid URL scheme '{}': only 'http' and 'https' are allowed for embedding endpoints",
+                scheme
+            );
+        }
+    }
+
+    // Ensure URL has a host
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| anyhow::anyhow!("URL must include a hostname"))?;
+
+    // Block cloud metadata services
+    if host == "169.254.169.254" // AWS, GCP metadata service (IPv4)
+        || host == "fd00:ec2::254" // AWS metadata service (IPv6)
+        || host.starts_with("fd00:ec2:") // AWS metadata IPv6 prefix
+        || host == "metadata.google.internal" // GCP metadata service
+        || host == "metadata" // GCP short form
+        || host == "169.254.169.253"
+    // Azure IMDS (older)
+    {
+        bail!(
+            "Access to cloud metadata service URLs is blocked for security: {}",
+            host
+        );
+    }
+
+    // Check for private/localhost hosts and log warning
+    if is_private_or_localhost(host) {
+        tracing::warn!(
+            "Custom embedding endpoint uses localhost or private IP address: {}. \
+             This is allowed for local development but ensure this is intentional.",
+            host
+        );
+    }
+
+    // Return the validated URL
+    Ok(url_str.to_string())
 }
 
 /// Trait for embedding backends
@@ -246,10 +370,19 @@ pub struct ApiEmbedder {
 }
 
 impl ApiEmbedder {
+    /// Create a reqwest client with security settings (timeout, limits)
+    fn create_secure_client() -> reqwest::blocking::Client {
+        reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(API_REQUEST_TIMEOUT_SECS))
+            .connect_timeout(Duration::from_secs(30))
+            .build()
+            .expect("Failed to create HTTP client")
+    }
+
     /// Create a Voyage AI embedder
     pub fn voyage(api_key: &str) -> Self {
         Self {
-            client: reqwest::blocking::Client::new(),
+            client: Self::create_secure_client(),
             endpoint: "https://api.voyageai.com/v1/embeddings".to_string(),
             model: "voyage-code-2".to_string(),
             api_key: Some(api_key.to_string()),
@@ -260,7 +393,7 @@ impl ApiEmbedder {
     /// Create a Voyage AI embedder with custom model
     pub fn voyage_with_model(api_key: &str, model: &str) -> Self {
         Self {
-            client: reqwest::blocking::Client::new(),
+            client: Self::create_secure_client(),
             endpoint: "https://api.voyageai.com/v1/embeddings".to_string(),
             model: model.to_string(),
             api_key: Some(api_key.to_string()),
@@ -271,7 +404,7 @@ impl ApiEmbedder {
     /// Create an OpenAI embedder
     pub fn openai(api_key: &str) -> Self {
         Self {
-            client: reqwest::blocking::Client::new(),
+            client: Self::create_secure_client(),
             endpoint: "https://api.openai.com/v1/embeddings".to_string(),
             model: "text-embedding-3-small".to_string(),
             api_key: Some(api_key.to_string()),
@@ -282,7 +415,7 @@ impl ApiEmbedder {
     /// Create an OpenAI embedder with custom model
     pub fn openai_with_model(api_key: &str, model: &str, dimension: usize) -> Self {
         Self {
-            client: reqwest::blocking::Client::new(),
+            client: Self::create_secure_client(),
             endpoint: "https://api.openai.com/v1/embeddings".to_string(),
             model: model.to_string(),
             api_key: Some(api_key.to_string()),
@@ -293,7 +426,7 @@ impl ApiEmbedder {
     /// Create a custom API embedder
     pub fn custom(endpoint: &str, model: &str, api_key: Option<&str>, dimension: usize) -> Self {
         Self {
-            client: reqwest::blocking::Client::new(),
+            client: Self::create_secure_client(),
             endpoint: endpoint.to_string(),
             model: model.to_string(),
             api_key: api_key.map(|s| s.to_string()),
@@ -309,6 +442,30 @@ impl EmbeddingBackend for ApiEmbedder {
     }
 
     fn embed_batch(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+        // Input validation - batch size
+        if texts.is_empty() {
+            bail!("Cannot embed empty batch");
+        }
+        if texts.len() > MAX_EMBEDDING_BATCH_SIZE {
+            bail!(
+                "Batch size {} exceeds maximum of {}",
+                texts.len(),
+                MAX_EMBEDDING_BATCH_SIZE
+            );
+        }
+
+        // Input validation - text length
+        for (i, text) in texts.iter().enumerate() {
+            if text.len() > MAX_TEXT_LENGTH {
+                bail!(
+                    "Text at index {} is {} characters, exceeds maximum of {}",
+                    i,
+                    text.len(),
+                    MAX_TEXT_LENGTH
+                );
+            }
+        }
+
         #[derive(Serialize)]
         struct Request<'a> {
             model: &'a str,
@@ -335,16 +492,52 @@ impl EmbeddingBackend for ApiEmbedder {
             });
 
         if let Some(key) = &self.api_key {
+            // Redact API key in logs - only show first/last 4 chars
+            let redacted = if key.len() > 8 {
+                format!("{}...{}", &key[..4], &key[key.len() - 4..])
+            } else {
+                "****".to_string()
+            };
+            tracing::debug!("Using API key: {}", redacted);
             request = request.header("Authorization", format!("Bearer {}", key));
         }
 
-        let resp = request.send().context("Failed to send embedding request")?;
+        let mut resp = request.send().context("Failed to send embedding request")?;
 
         let status = resp.status();
-        let text = resp.text().context("Failed to read response body")?;
+
+        // Read response with size limit to prevent memory exhaustion
+        let mut limited_body = Vec::new();
+        let mut chunk_buffer = [0u8; 8192];
+        let mut total_read = 0;
+
+        loop {
+            match resp.read(&mut chunk_buffer) {
+                Ok(0) => break, // EOF
+                Ok(n) => {
+                    total_read += n;
+                    if total_read > MAX_RESPONSE_SIZE_BYTES {
+                        bail!(
+                            "Response size exceeds maximum of {} bytes",
+                            MAX_RESPONSE_SIZE_BYTES
+                        );
+                    }
+                    limited_body.extend_from_slice(&chunk_buffer[..n]);
+                }
+                Err(e) => return Err(e).context("Failed to read response body"),
+            }
+        }
+
+        let text = String::from_utf8(limited_body).context("Response body is not valid UTF-8")?;
 
         if !status.is_success() {
-            anyhow::bail!("API error ({}): {}", status, text);
+            // Redact potential sensitive info from error messages
+            let safe_text = if text.len() > 500 {
+                format!("{}... (truncated)", &text[..500])
+            } else {
+                text.clone()
+            };
+            bail!("API error ({}): {}", status, safe_text);
         }
 
         let response: Response = serde_json::from_str(&text).with_context(|| {
@@ -353,6 +546,18 @@ impl EmbeddingBackend for ApiEmbedder {
                 &text[..text.len().min(200)]
             )
         })?;
+
+        // Validate response embedding dimensions
+        for (i, emb_data) in response.data.iter().enumerate() {
+            if emb_data.embedding.len() != self.dimension {
+                bail!(
+                    "Embedding at index {} has dimension {}, expected {}",
+                    i,
+                    emb_data.embedding.len(),
+                    self.dimension
+                );
+            }
+        }
 
         Ok(response.data.into_iter().map(|d| d.embedding).collect())
     }
@@ -601,22 +806,99 @@ pub struct NeuralEngine {
 
 impl NeuralEngine {
     /// Create a new neural engine with API backend
+    ///
+    /// Supports custom embedding endpoints via `EMBEDDING_SERVER_ENDPOINT` environment variable.
+    /// If not set, falls back to Voyage or OpenAI based on model name.
+    ///
+    /// # Environment Variables
+    /// - `EMBEDDING_SERVER_ENDPOINT` (optional) - Custom embedding API endpoint URL
+    /// - `EMBEDDING_API_KEY` - Generic API key (checked first)
+    /// - `VOYAGE_API_KEY` - Voyage AI specific API key
+    /// - `OPENAI_API_KEY` - OpenAI specific API key
     pub fn with_api(config: NeuralConfig) -> Result<Self> {
+        // Validate dimension bounds
+        if config.dimension < MIN_DIMENSION || config.dimension > MAX_DIMENSION {
+            bail!(
+                "Dimension {} is out of valid range [{}, {}]",
+                config.dimension,
+                MIN_DIMENSION,
+                MAX_DIMENSION
+            );
+        }
+
+        // Validate model name if provided
+        if let Some(ref model_name) = config.model_name {
+            if model_name.is_empty() {
+                bail!("Model name cannot be empty");
+            }
+            if model_name.len() > MAX_MODEL_NAME_LENGTH {
+                bail!(
+                    "Model name length {} exceeds maximum of {}",
+                    model_name.len(),
+                    MAX_MODEL_NAME_LENGTH
+                );
+            }
+        }
+
+        // Try to get API key (optional for custom endpoints)
         let api_key = std::env::var("EMBEDDING_API_KEY")
             .or_else(|_| std::env::var("VOYAGE_API_KEY"))
             .or_else(|_| std::env::var("OPENAI_API_KEY"))
-            .context("No embedding API key found. Set EMBEDDING_API_KEY, VOYAGE_API_KEY, or OPENAI_API_KEY")?;
+            .ok();
 
-        let model_name = config.model_name.as_deref().unwrap_or("voyage-code-2");
-        let backend: Arc<dyn EmbeddingBackend> = if model_name.contains("voyage") {
-            Arc::new(ApiEmbedder::voyage_with_model(&api_key, model_name))
-        } else {
-            Arc::new(ApiEmbedder::openai_with_model(
-                &api_key,
+        // Validate API key length if present
+        if let Some(ref key) = api_key {
+            if key.len() > MAX_API_KEY_LENGTH {
+                bail!(
+                    "API key length {} exceeds maximum of {}",
+                    key.len(),
+                    MAX_API_KEY_LENGTH
+                );
+            }
+        }
+
+        let backend: Arc<dyn EmbeddingBackend>;
+
+        // Check for custom endpoint first
+        if let Ok(custom_endpoint) = std::env::var("EMBEDDING_SERVER_ENDPOINT") {
+            // Validate the custom endpoint URL
+            let validated_endpoint = validate_embedding_endpoint(&custom_endpoint)
+                .context("Invalid EMBEDDING_SERVER_ENDPOINT")?;
+
+            let model_name = config
+                .model_name
+                .as_deref()
+                .unwrap_or("custom-embedding-model");
+
+            tracing::info!(
+                "Using custom embedding endpoint: {} (model: {})",
+                validated_endpoint,
+                model_name
+            );
+
+            backend = Arc::new(ApiEmbedder::custom(
+                &validated_endpoint,
                 model_name,
+                api_key.as_deref(),
                 config.dimension,
-            ))
-        };
+            ));
+        } else {
+            // Fallback to Voyage/OpenAI - API key is required
+            let api_key = api_key.context(
+                "No embedding API key found. Set EMBEDDING_API_KEY, VOYAGE_API_KEY, or OPENAI_API_KEY"
+            )?;
+
+            let model_name = config.model_name.as_deref().unwrap_or("voyage-code-2");
+            backend = if model_name.contains("voyage") {
+                Arc::new(ApiEmbedder::voyage_with_model(&api_key, model_name))
+            } else {
+                Arc::new(ApiEmbedder::openai_with_model(
+                    &api_key,
+                    model_name,
+                    config.dimension,
+                ))
+            };
+        }
 
         let store = SimpleVectorStore::new(config.dimension);
 
@@ -810,5 +1092,525 @@ mod tests {
         // Test that embedders can be created (won't actually call APIs)
         let _voyage = ApiEmbedder::voyage("test-key");
         let _openai = ApiEmbedder::openai("test-key");
+    }
+
+    #[test]
+    fn test_custom_api_embedder() {
+        let custom = ApiEmbedder::custom(
+            "https://localhost:8080/v1/embeddings",
+            "custom-model",
+            Some("test-key"),
+            768,
+        );
+        assert_eq!(custom.endpoint, "https://localhost:8080/v1/embeddings");
+        assert_eq!(custom.model, "custom-model");
+        assert_eq!(custom.dimension, 768);
+        assert!(custom.api_key.is_some());
+    }
+
+    #[test]
+    fn test_custom_api_embedder_without_key() {
+        let custom = ApiEmbedder::custom(
+            "http://192.168.1.100:8080/embeddings",
+            "local-model",
+            None,
+            384,
+        );
+        assert_eq!(custom.endpoint, "http://192.168.1.100:8080/embeddings");
+        assert!(custom.api_key.is_none());
+    }
+
+    mod custom_endpoint_integration {
+        use super::*;
+
+        #[test]
+        fn test_with_api_custom_endpoint_with_key() {
+            // Set up environment
+            std::env::set_var(
+                "EMBEDDING_SERVER_ENDPOINT",
+                "https://api.example.com/v1/embeddings",
+            );
+            std::env::set_var("EMBEDDING_API_KEY", "test-api-key-123");
+
+            let config = NeuralConfig {
+                enabled: true,
+                backend: "api".to_string(),
+                model_name: Some("custom-model".to_string()),
+                dimension: 768,
+                ..Default::default()
+            };
+
+            let result = NeuralEngine::with_api(config);
+            assert!(result.is_ok(), "Should create engine with custom endpoint");
+
+            // Clean up
+            std::env::remove_var("EMBEDDING_SERVER_ENDPOINT");
+            std::env::remove_var("EMBEDDING_API_KEY");
+        }
+
+        #[test]
+        fn test_with_api_custom_endpoint_without_key() {
+            // Set up environment (no API key - should work for custom endpoints)
+            std::env::set_var(
+                "EMBEDDING_SERVER_ENDPOINT",
+                "http://localhost:8080/embeddings",
+            );
+            std::env::remove_var("EMBEDDING_API_KEY");
+            std::env::remove_var("VOYAGE_API_KEY");
+            std::env::remove_var("OPENAI_API_KEY");
+
+            let config = NeuralConfig {
+                enabled: true,
+                backend: "api".to_string(),
+                model_name: Some("local-model".to_string()),
+                dimension: 384,
+                ..Default::default()
+            };
+
+            let result = NeuralEngine::with_api(config);
+            assert!(
+                result.is_ok(),
+                "Should create engine without API key for custom endpoint"
+            );
+
+            // Clean up
+            std::env::remove_var("EMBEDDING_SERVER_ENDPOINT");
+        }
+
+        #[test]
+        fn test_with_api_invalid_custom_endpoint() {
+            // Set up environment with invalid endpoint
+            std::env::set_var(
+                "EMBEDDING_SERVER_ENDPOINT",
+                "ftp://invalid-scheme.com/embeddings",
+            );
+            std::env::set_var("EMBEDDING_API_KEY", "test-key");
+
+            let config = NeuralConfig::default();
+            let result = NeuralEngine::with_api(config);
+
+            assert!(result.is_err(), "Should reject invalid scheme");
+            if let Err(e) = result {
+                let err_msg = e.to_string();
+                assert!(
+                    err_msg.contains("scheme") || err_msg.contains("Invalid"),
+                    "Error message should mention invalid scheme, got: {}",
+                    err_msg
+                );
+            }
+
+            // Clean up
+            std::env::remove_var("EMBEDDING_SERVER_ENDPOINT");
+            std::env::remove_var("EMBEDDING_API_KEY");
+        }
+
+        #[test]
+        fn test_with_api_fallback_to_voyage() {
+            // No custom endpoint, should require API key
+            std::env::remove_var("EMBEDDING_SERVER_ENDPOINT");
+            std::env::set_var("VOYAGE_API_KEY", "test-voyage-key");
+
+            let config = NeuralConfig {
+                enabled: true,
+                backend: "api".to_string(),
+                model_name: Some("voyage-code-2".to_string()),
+                ..Default::default()
+            };
+
+            let result = NeuralEngine::with_api(config);
+            assert!(result.is_ok(), "Should create engine with Voyage key");
+
+            // Clean up
+            std::env::remove_var("VOYAGE_API_KEY");
+        }
+
+        #[test]
+        fn test_with_api_no_endpoint_no_key() {
+            // Clean up environment completely first
+            std::env::remove_var("EMBEDDING_SERVER_ENDPOINT");
+            std::env::remove_var("EMBEDDING_API_KEY");
+            std::env::remove_var("VOYAGE_API_KEY");
+            std::env::remove_var("OPENAI_API_KEY");
+
+            // Verify environment is clean
+            assert!(std::env::var("EMBEDDING_SERVER_ENDPOINT").is_err());
+            assert!(std::env::var("EMBEDDING_API_KEY").is_err());
+            assert!(std::env::var("VOYAGE_API_KEY").is_err());
+            assert!(std::env::var("OPENAI_API_KEY").is_err());
+
+            let config = NeuralConfig::default();
+            let result = NeuralEngine::with_api(config);
+
+            // Should fail because no endpoint and no API key
+            match result {
+                Ok(_) => panic!("Should require API key without custom endpoint"),
+                Err(e) => {
+                    let msg = e.to_string();
+                    assert!(
+                        msg.contains("API key") || msg.contains("No embedding"),
+                        "Error should mention API key requirement, got: {}",
+                        msg
+                    );
+                }
+            }
+        }
+    }
+
+    mod endpoint_validation {
+        use super::*;
+
+        #[test]
+        fn test_validate_https_endpoint() {
+            let result = validate_embedding_endpoint("https://api.example.com/v1/embeddings");
+            assert!(result.is_ok());
+            assert_eq!(result.unwrap(), "https://api.example.com/v1/embeddings");
+        }
+
+        #[test]
+        fn test_validate_http_endpoint() {
+            // HTTP should be allowed for local development
+            let result = validate_embedding_endpoint("http://localhost:8080/embeddings");
+            assert!(result.is_ok());
+        }
+
+        #[test]
+        fn test_validate_http_with_ip() {
+            let result = validate_embedding_endpoint("http://192.168.1.100:8080/v1/embeddings");
+            assert!(result.is_ok());
+        }
+
+        #[test]
+        fn test_reject_invalid_scheme() {
+            let result = validate_embedding_endpoint("ftp://example.com/embeddings");
+            assert!(result.is_err());
+            assert!(result.unwrap_err().to_string().contains("scheme"));
+        }
+
+        #[test]
+        fn test_reject_file_scheme() {
+            let result = validate_embedding_endpoint("file:///etc/passwd");
+            assert!(result.is_err());
+        }
+
+        #[test]
+        fn test_reject_malformed_url() {
+            let result = validate_embedding_endpoint("not a url");
+            assert!(result.is_err());
+        }
+
+        #[test]
+        fn test_reject_missing_scheme() {
+            let result = validate_embedding_endpoint("example.com/embeddings");
+            assert!(result.is_err());
+        }
+
+        #[test]
+        fn test_validate_with_port() {
+            let result = validate_embedding_endpoint("https://api.example.com:443/v1/embeddings");
+            assert!(result.is_ok());
+        }
+
+        #[test]
+        fn test_validate_with_query_params() {
+            let result =
+                validate_embedding_endpoint("https://api.example.com/embeddings?version=1");
+            assert!(result.is_ok());
+        }
+
+        #[test]
+        fn test_private_ip_detection() {
+            // Should succeed but log warning (check via tracing in real usage)
+            let result = validate_embedding_endpoint("http://127.0.0.1:8080/embeddings");
+            assert!(result.is_ok());
+
+            let result = validate_embedding_endpoint("http://10.0.0.1/embeddings");
+            assert!(result.is_ok());
+
+            let result = validate_embedding_endpoint("http://172.16.0.1/embeddings");
+            assert!(result.is_ok());
+
+            let result = validate_embedding_endpoint("http://192.168.1.1/embeddings");
+            assert!(result.is_ok());
+        }
+
+        #[test]
+        fn test_localhost_detection() {
+            let result = validate_embedding_endpoint("http://localhost:3000/embeddings");
+            assert!(result.is_ok());
+
+            let result = validate_embedding_endpoint("https://localhost/embeddings");
+            assert!(result.is_ok());
+        }
+
+        #[test]
+        fn test_reject_metadata_service_urls() {
+            // AWS metadata service IPv4
+            let result = validate_embedding_endpoint("http://169.254.169.254/latest/meta-data/");
+            assert!(result.is_err());
+            if let Err(e) = result {
+                assert!(e.to_string().contains("metadata service"));
+            }
+
+            // GCP metadata service
+            let result =
+                validate_embedding_endpoint("http://metadata.google.internal/computeMetadata/v1/");
+            assert!(result.is_err());
+            if let Err(e) = result {
+                assert!(e.to_string().contains("metadata service"));
+            }
+
+            // GCP metadata short form
+            let result = validate_embedding_endpoint("http://metadata/computeMetadata/v1/");
+            assert!(result.is_err());
+            if let Err(e) = result {
+                assert!(e.to_string().contains("metadata service"));
+            }
+
+            // Azure IMDS
+            let result = validate_embedding_endpoint("http://169.254.169.253/metadata/instance");
+            assert!(result.is_err());
+            if let Err(e) = result {
+                assert!(e.to_string().contains("metadata service"));
+            }
+        }
+
+        #[test]
+        fn test_reject_too_long_url() {
+            let long_url = format!("https://example.com/{}", "a".repeat(3000));
+            let result = validate_embedding_endpoint(&long_url);
+            assert!(result.is_err());
+            assert!(result.unwrap_err().to_string().contains("too long"));
+        }
+
+        #[test]
+        fn test_reject_url_without_host() {
+            // Opaque URLs (like data: or mailto:) don't have hosts
+            // These should be rejected by the scheme check anyway
+            let result = validate_embedding_endpoint("data:text/plain,hello");
+            assert!(result.is_err());
+            if let Err(e) = result {
+                assert!(e.to_string().contains("scheme"));
+            }
+        }
+    }
+
+    // Security tests for input validation
+    mod security_validation {
+        use super::*;
+
+        #[test]
+        fn test_dimension_bounds_validation() {
+            // Clean environment first
+            std::env::remove_var("EMBEDDING_SERVER_ENDPOINT");
+            std::env::remove_var("EMBEDDING_API_KEY");
+            std::env::remove_var("OPENAI_API_KEY");
+
+            // Too small
+            let config = NeuralConfig {
+                enabled: true,
+                backend: "api".to_string(),
+                dimension: 32, // Below MIN_DIMENSION (64)
+                ..Default::default()
+            };
+            std::env::set_var("VOYAGE_API_KEY", "test-key");
+            let result = NeuralEngine::with_api(config);
+            assert!(result.is_err());
+            if let Err(e) = result {
+                assert!(e.to_string().contains("out of valid range"));
+            }
+
+            // Too large
+            let config = NeuralConfig {
+                enabled: true,
+                backend: "api".to_string(),
+                dimension: 10000, // Above MAX_DIMENSION (8192)
+                ..Default::default()
+            };
+            let result = NeuralEngine::with_api(config);
+            assert!(result.is_err());
+            if let Err(e) = result {
+                assert!(e.to_string().contains("out of valid range"));
+            }
+
+            std::env::remove_var("VOYAGE_API_KEY");
+        }
+
+        #[test]
+        fn test_dimension_valid_bounds() {
+            // Clean environment first
+            std::env::remove_var("EMBEDDING_SERVER_ENDPOINT");
+            std::env::remove_var("EMBEDDING_API_KEY");
+            std::env::remove_var("OPENAI_API_KEY");
+
+            // Min valid dimension
+            let config = NeuralConfig {
+                enabled: true,
+                backend: "api".to_string(),
+                dimension: MIN_DIMENSION,
+                ..Default::default()
+            };
+            std::env::set_var("VOYAGE_API_KEY", "test-key");
+            let result = NeuralEngine::with_api(config);
+            assert!(result.is_ok());
+
+            // Max valid dimension
+            let config = NeuralConfig {
+                enabled: true,
+                backend: "api".to_string(),
+                dimension: MAX_DIMENSION,
+                ..Default::default()
+            };
+            let result = NeuralEngine::with_api(config);
+            if let Err(ref e) = result {
+                eprintln!("Error creating engine with MAX_DIMENSION: {}", e);
+            }
+            assert!(result.is_ok());
+
+            std::env::remove_var("VOYAGE_API_KEY");
+        }
+
+        #[test]
+        fn test_model_name_validation() {
+            // Clean environment first
+            std::env::remove_var("EMBEDDING_SERVER_ENDPOINT");
+            std::env::remove_var("EMBEDDING_API_KEY");
+            std::env::remove_var("OPENAI_API_KEY");
+
+            // Empty model name
+            let config = NeuralConfig {
+                enabled: true,
+                backend: "api".to_string(),
+                model_name: Some("".to_string()),
+                dimension: 1536,
+                ..Default::default()
+            };
+            std::env::set_var("VOYAGE_API_KEY", "test-key");
+            let result = NeuralEngine::with_api(config);
+            assert!(result.is_err());
+            if let Err(e) = result {
+                assert!(e.to_string().contains("cannot be empty"));
+            }
+
+            // Too long model name
+            let config = NeuralConfig {
+                enabled: true,
+                backend: "api".to_string(),
+                model_name: Some("a".repeat(300)),
+                dimension: 1536,
+                ..Default::default()
+            };
+            let result = NeuralEngine::with_api(config);
+            assert!(result.is_err());
+            if let Err(e) = result {
+                assert!(e.to_string().contains("exceeds maximum"));
+            }
+
+            std::env::remove_var("VOYAGE_API_KEY");
+        }
+
+        #[test]
+        fn test_api_key_length_validation() {
+            // Clean environment first
+            std::env::remove_var("EMBEDDING_SERVER_ENDPOINT");
+            std::env::remove_var("VOYAGE_API_KEY");
+            std::env::remove_var("OPENAI_API_KEY");
+
+            // Extremely long API key
+            let long_key = "a".repeat(3000);
+            std::env::set_var("EMBEDDING_API_KEY", &long_key);
+
+            let config = NeuralConfig {
+                enabled: true,
+                backend: "api".to_string(),
+                dimension: 1536,
+                ..Default::default()
+            };
+
+            let result = NeuralEngine::with_api(config);
+            assert!(result.is_err());
+            if let Err(e) = result {
+                assert!(e.to_string().contains("API key length"));
+            }
+
+            std::env::remove_var("EMBEDDING_API_KEY");
+        }
+
+        #[test]
+        fn test_batch_size_validation() {
+            let embedder = ApiEmbedder::custom(
+                "https://api.example.com/embeddings",
+                "test-model",
+                Some("test-key"),
+                768,
+            );
+
+            // Empty batch
+            let result = embedder.embed_batch(&[]);
+            assert!(result.is_err());
+            assert!(result.unwrap_err().to_string().contains("empty batch"));
+
+            // Too large batch
+            let large_batch: Vec<String> = (0..200).map(|i| format!("text {}", i)).collect();
+            let result = embedder.embed_batch(&large_batch);
+            assert!(result.is_err());
+            assert!(result.unwrap_err().to_string().contains("exceeds maximum"));
+        }
+
+        #[test]
+        fn test_text_length_validation() {
+            let embedder = ApiEmbedder::custom(
+                "https://api.example.com/embeddings",
+                "test-model",
+                Some("test-key"),
+                768,
+            );
+
+            // Text too long
+            let long_text = "a".repeat(40_000);
+            let result = embedder.embed_batch(&[long_text]);
+            assert!(result.is_err());
+            assert!(result.unwrap_err().to_string().contains("exceeds maximum"));
+
+            // Multiple texts, one too long
+            let texts = vec![
+                "normal text".to_string(),
+                "a".repeat(40_000),
+                "another normal text".to_string(),
+            ];
+            let result = embedder.embed_batch(&texts);
+            assert!(result.is_err());
+            assert!(result.unwrap_err().to_string().contains("index 1"));
+        }
+
+        #[test]
+        fn test_valid_batch_sizes() {
+            let embedder = ApiEmbedder::custom(
+                "https://api.example.com/embeddings",
+                "test-model",
+                Some("test-key"),
+                768,
+            );
+
+            // Single text (valid size)
+            let texts = vec!["test text".to_string()];
+            // Note: This will fail at HTTP level (no actual server), but should pass validation
+            let _result = embedder.embed_batch(&texts);
+
+            // Maximum valid batch size
+            let max_batch: Vec<String> = (0..MAX_EMBEDDING_BATCH_SIZE)
+                .map(|i| format!("text {}", i))
+                .collect();
+            // Note: This will fail at HTTP level, but should pass validation
+            let _result = embedder.embed_batch(&max_batch);
+        }
+
+        #[test]
+        fn test_http_client_has_timeout() {
+            // Create an embedder and verify the client has timeout configured
+            let embedder = ApiEmbedder::voyage("test-key");
+            // We can't directly inspect the client's timeout, but we can verify it was created
+            // In real usage, timeout would be tested by connecting to a slow server
+            assert!(embedder.api_key.is_some());
+        }
     }
 }

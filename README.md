@@ -147,10 +147,11 @@ narsil-mcp \
   --neural-model voyage-code-2  # Model to use
 ```
 
-**Note:** Neural embeddings require an API key. Set one of:
-- `EMBEDDING_API_KEY`
-- `VOYAGE_API_KEY` (for Voyage AI)
-- `OPENAI_API_KEY` (for OpenAI)
+**Note:** Neural embeddings require an API key (or custom endpoint). Set one of:
+- `EMBEDDING_API_KEY` - Generic API key for any provider
+- `VOYAGE_API_KEY` - Voyage AI specific API key
+- `OPENAI_API_KEY` - OpenAI specific API key
+- `EMBEDDING_SERVER_ENDPOINT` - Custom embedding API endpoint URL (optional, allows using self-hosted models)
 
 ### Visualization Frontend
 
@@ -203,6 +204,7 @@ Neural embeddings enable true semantic code search - finding functionally simila
 |---------|------|--------|----------|
 | Voyage AI | `--neural-backend api` | `voyage-code-2`, `voyage-code-3` | Code-specific embeddings, best accuracy |
 | OpenAI | `--neural-backend api` | `text-embedding-3-small`, `text-embedding-3-large` | General embeddings, wide availability |
+| Custom/Self-hosted | `--neural-backend api` | Any compatible | Local deployment, custom models (use `EMBEDDING_SERVER_ENDPOINT`) |
 | ONNX | `--neural-backend onnx` | Local models | Offline usage, no API costs |
 
 **Setup:**
@@ -216,9 +218,20 @@ narsil-mcp --repos ~/project --neural --neural-backend api --neural-model voyage
 export OPENAI_API_KEY="your-key-here"
 narsil-mcp --repos ~/project --neural --neural-backend api --neural-model text-embedding-3-small
 
+# Using custom/self-hosted embedding server
+export EMBEDDING_SERVER_ENDPOINT="http://localhost:8080/v1/embeddings"
+export EMBEDDING_API_KEY="your-optional-api-key"  # Optional, depends on your server
+narsil-mcp --repos ~/project --neural --neural-backend api --neural-model custom-model
+
 # Using local ONNX model (no API key needed)
 narsil-mcp --repos ~/project --neural --neural-backend onnx
 ```
+
+**Security Note for Custom Endpoints:**
+- Use HTTPS for production endpoints to prevent credential exposure
+- HTTP is allowed for local development (localhost/private IPs) but will generate warnings
+- The endpoint must use `http://` or `https://` scheme - other protocols are rejected for security
+- API keys are optional for custom endpoints if your server doesn't require authentication
 
 **Use Cases:**
 
