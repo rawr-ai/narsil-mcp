@@ -1563,6 +1563,44 @@ impl TaintAnalyzer {
             sanitizes_for: vec![SinkKind::CommandExec],
             languages: vec!["ruby".to_string()],
         });
+
+        // Rust sanitizers
+        self.sanitizer_patterns.push(SanitizerPattern {
+            name: "rust_path_sanitize".to_string(),
+            function_patterns: vec![
+                "canonicalize(".to_string(),
+                "validate_path(".to_string(),
+                ".canonicalize()".to_string(),
+                "Path::new(".to_string(),
+                ".file_name()".to_string(),
+                ".file_stem()".to_string(),
+            ],
+            sanitizes_for: vec![SinkKind::FilePath, SinkKind::FileWrite],
+            languages: vec!["rust".to_string()],
+        });
+
+        self.sanitizer_patterns.push(SanitizerPattern {
+            name: "rust_sql_sanitize".to_string(),
+            function_patterns: vec![
+                "query_as!".to_string(),
+                "query!".to_string(),
+                ".bind(".to_string(),
+                "execute!".to_string(),
+            ],
+            sanitizes_for: vec![SinkKind::SqlQuery],
+            languages: vec!["rust".to_string()],
+        });
+
+        self.sanitizer_patterns.push(SanitizerPattern {
+            name: "rust_html_sanitize".to_string(),
+            function_patterns: vec![
+                "html_escape(".to_string(),
+                "Escape::new(".to_string(),
+                "encode(".to_string(),
+            ],
+            sanitizes_for: vec![SinkKind::HtmlOutput],
+            languages: vec!["rust".to_string()],
+        });
     }
 
     /// Analyze code for taint flows

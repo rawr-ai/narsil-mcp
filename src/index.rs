@@ -1218,8 +1218,32 @@ impl CodeIntelEngine {
 
     pub async fn read_resource(&self, uri: &str) -> Result<String> {
         // Parse URI like "file:///path/to/file"
-        let path = uri.strip_prefix("file://").unwrap_or(uri);
-        std::fs::read_to_string(path).context("Failed to read resource")
+        let path_str = uri.strip_prefix("file://").unwrap_or(uri);
+        let requested_path = Path::new(path_str);
+
+        // Security: Validate the path is within one of the indexed repositories
+        // Try to canonicalize the requested path first
+        let canonical_requested = requested_path
+            .canonicalize()
+            .context("Path does not exist or cannot be accessed")?;
+
+        // Check if the path is within any indexed repository
+        for repo_entry in self.repos.iter() {
+            let repo_meta = repo_entry.value();
+            if let Ok(canonical_root) = repo_meta.path.canonicalize() {
+                if canonical_requested.starts_with(&canonical_root) {
+                    // Path is within this repository, safe to read
+                    return std::fs::read_to_string(&canonical_requested)
+                        .context("Failed to read resource");
+                }
+            }
+        }
+
+        // Path is not within any indexed repository - reject the request
+        Err(anyhow!(
+            "Access denied: path '{}' is outside all indexed repositories",
+            path_str
+        ))
     }
 
     // === Persistence Methods ===
@@ -3562,21 +3586,18 @@ impl CodeIntelEngine {
         }
 
         // Filter and aggregate results
-        let mut total_vulns = 0;
         let mut output = String::new();
         output.push_str(&format!(
             "# Injection Vulnerability Analysis: {}\n\n",
             repo_name
         ));
 
-        // Aggregate statistics
-        let mut by_type: std::collections::HashMap<String, Vec<crate::taint::TaintFlow>> =
-            std::collections::HashMap::new();
+        // Collect all vulnerabilities first
+        let mut all_vulns: Vec<crate::taint::TaintFlow> = Vec::new();
 
         for result in &all_results {
             for vuln in &result.vulnerabilities {
                 if let Some(ref vuln_kind) = vuln.vulnerability {
-                    let type_name = vuln_kind.display_name().to_string();
                     let type_key = match vuln_kind {
                         crate::taint::VulnerabilityKind::SqlInjection => "sql",
                         crate::taint::VulnerabilityKind::Xss => "xss",
@@ -3586,10 +3607,43 @@ impl CodeIntelEngine {
                     };
 
                     if include_all || vuln_types.iter().any(|t| t == type_key) {
-                        by_type.entry(type_name).or_default().push(vuln.clone());
-                        total_vulns += 1;
+                        all_vulns.push(vuln.clone());
                     }
                 }
+            }
+        }
+
+        // Sort by severity (highest first) then by confidence
+        all_vulns.sort_by(|a, b| {
+            let sev_a = a.severity.unwrap_or(crate::taint::Severity::Low);
+            let sev_b = b.severity.unwrap_or(crate::taint::Severity::Low);
+            sev_b
+                .cmp(&sev_a)
+                .then_with(|| b.confidence.cmp(&a.confidence))
+        });
+
+        let total_vulns = all_vulns.len();
+
+        // Apply pagination to prevent overwhelming responses
+        const MAX_FINDINGS_PER_REQUEST: usize = 50;
+        let findings_to_show = if total_vulns > MAX_FINDINGS_PER_REQUEST {
+            info!(
+                "Limiting output to top {} of {} findings (sorted by severity)",
+                MAX_FINDINGS_PER_REQUEST, total_vulns
+            );
+            &all_vulns[..MAX_FINDINGS_PER_REQUEST]
+        } else {
+            &all_vulns[..]
+        };
+
+        // Aggregate by type
+        let mut by_type: std::collections::HashMap<String, Vec<crate::taint::TaintFlow>> =
+            std::collections::HashMap::new();
+
+        for vuln in findings_to_show {
+            if let Some(ref vuln_kind) = vuln.vulnerability {
+                let type_name = vuln_kind.display_name().to_string();
+                by_type.entry(type_name).or_default().push(vuln.clone());
             }
         }
 
@@ -3599,7 +3653,16 @@ impl CodeIntelEngine {
             "- **Files Analyzed**: {}\n",
             files_to_analyze.len()
         ));
-        output.push_str(&format!("- **Vulnerabilities Found**: {}\n\n", total_vulns));
+        output.push_str(&format!("- **Vulnerabilities Found**: {}\n", total_vulns));
+
+        if total_vulns > MAX_FINDINGS_PER_REQUEST {
+            output.push_str(&format!(
+                "- **⚠️ Results Truncated**: Showing top {} most severe findings (sorted by severity and confidence)\n",
+                MAX_FINDINGS_PER_REQUEST
+            ));
+            output.push_str("- **Note**: Many findings may be false positives. Focus on high-severity issues first.\n");
+        }
+        output.push('\n');
 
         if total_vulns == 0 {
             output.push_str("No injection vulnerabilities detected.\n");

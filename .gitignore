@@ -59,3 +59,7 @@ coverage/
 
 # AI guidance
 CLAUDE.md
+
+# Internal documentation (not for version control)
+TAINT_ANALYSIS_IMPROVEMENTS.md
+SECURITY_PATCH.md
