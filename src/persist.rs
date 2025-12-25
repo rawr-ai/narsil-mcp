@@ -450,7 +450,7 @@ pub enum ChangeType {
 fn is_source_file(path: &Path) -> bool {
     let extensions = [
         "rs", "py", "js", "jsx", "ts", "tsx", "go", "java", "c", "h", "cpp", "hpp", "cc", "cxx",
-        "hxx",
+        "hxx", "swift", "v", "vh", "sv", "svh",
     ];
 
     path.extension()

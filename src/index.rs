@@ -6445,6 +6445,14 @@ fn detect_language_from_path(path: &str) -> String {
         "php".to_string()
     } else if path.ends_with(".cs") {
         "csharp".to_string()
+    } else if path.ends_with(".swift") {
+        "swift".to_string()
+    } else if path.ends_with(".v")
+        || path.ends_with(".vh")
+        || path.ends_with(".sv")
+        || path.ends_with(".svh")
+    {
+        "verilog".to_string()
     } else {
         "unknown".to_string()
     }

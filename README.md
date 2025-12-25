@@ -61,6 +61,8 @@ A Rust-powered MCP (Model Context Protocol) server providing AI assistants with 
 | **Ruby** | `.rb`, `.rake`, `.gemspec` | methods, classes, modules |
 | **Kotlin** | `.kt`, `.kts` | functions, classes, objects, interfaces |
 | **PHP** | `.php`, `.phtml` | functions, methods, classes, interfaces, traits |
+| **Swift** | `.swift` | classes, structs, enums, protocols, functions |
+| **Verilog/SystemVerilog** | `.v`, `.vh`, `.sv`, `.svh` | modules, tasks, functions, interfaces, classes |
 
 ## Installation
 

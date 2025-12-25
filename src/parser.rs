@@ -212,6 +212,31 @@ impl LanguageParser {
                     (trait_declaration name: (name) @trait.name) @trait.def
                 "#,
             },
+            // Swift
+            // Note: Swift tree-sitter uses class_declaration for classes, structs, and enums
+            LanguageConfig {
+                name: "swift".to_string(),
+                language: tree_sitter_swift::LANGUAGE.into(),
+                extensions: vec!["swift"],
+                symbol_query: r#"
+                    (class_declaration name: (type_identifier) @class.name) @class.def
+                    (protocol_declaration name: (type_identifier) @interface.name) @interface.def
+                    (function_declaration name: (simple_identifier) @function.name) @function.def
+                "#,
+            },
+            // Verilog/SystemVerilog
+            LanguageConfig {
+                name: "verilog".to_string(),
+                language: tree_sitter_verilog::LANGUAGE.into(),
+                extensions: vec!["v", "vh", "sv", "svh"],
+                symbol_query: r#"
+                    (module_declaration (module_header (simple_identifier) @module.name)) @module.def
+                    (task_body_declaration (task_identifier (task_identifier (simple_identifier) @function.name))) @function.def
+                    (function_body_declaration (function_identifier (function_identifier (simple_identifier) @function.name))) @function.def
+                    (interface_declaration (interface_identifier (simple_identifier) @interface.name)) @interface.def
+                    (class_declaration (class_identifier (simple_identifier) @class.name)) @class.def
+                "#,
+            },
         ];
 
         Ok(Self { configs })
@@ -347,7 +372,7 @@ fn parse_symbol_kind(capture_name: &str) -> SymbolKind {
         "trait" => SymbolKind::Trait,
         "type" => SymbolKind::TypeAlias,
         "const" | "static" => SymbolKind::Constant,
-        "mod" | "namespace" => SymbolKind::Module,
+        "mod" | "module" | "namespace" => SymbolKind::Module,
         "impl" => SymbolKind::Implementation,
         "var" | "arrow" => SymbolKind::Variable,
         _ => SymbolKind::Unknown,
@@ -466,5 +491,127 @@ namespace MyApp
         assert!(names.contains(&&"DoWork".to_string()), "Should find method");
         assert!(names.contains(&&"Point".to_string()), "Should find struct");
         assert!(names.contains(&&"Status".to_string()), "Should find enum");
+    }
+
+    #[test]
+    fn test_parse_swift() {
+        let parser = LanguageParser::new().unwrap();
+        let content = r#"
+class MyClass {
+    var name: String
+
+    init(name: String) {
+        self.name = name
+    }
+
+    func greet() -> String {
+        return "Hello, \(name)"
+    }
+}
+
+struct Point {
+    var x: Int
+    var y: Int
+}
+
+protocol Drawable {
+    func draw()
+}
+
+enum Direction {
+    case north
+    case south
+    case east
+    case west
+}
+
+func standaloneFunction() {
+    print("Hello")
+}
+        "#;
+
+        let parsed = parser.parse_file(Path::new("test.swift"), content).unwrap();
+        assert_eq!(parsed.language, "swift");
+        assert!(!parsed.symbols.is_empty());
+
+        let names: Vec<_> = parsed.symbols.iter().map(|s| &s.name).collect();
+        assert!(names.contains(&&"MyClass".to_string()), "Should find class");
+        assert!(names.contains(&&"Point".to_string()), "Should find struct");
+        assert!(
+            names.contains(&&"Drawable".to_string()),
+            "Should find protocol"
+        );
+        assert!(
+            names.contains(&&"Direction".to_string()),
+            "Should find enum"
+        );
+        assert!(
+            names.contains(&&"standaloneFunction".to_string()),
+            "Should find function"
+        );
+    }
+
+    #[test]
+    fn test_parse_verilog() {
+        let parser = LanguageParser::new().unwrap();
+        let content = r#"
+module counter(
+    input clk,
+    input reset,
+    output reg [7:0] count
+);
+    always @(posedge clk or posedge reset) begin
+        if (reset)
+            count <= 8'b0;
+        else
+            count <= count + 1;
+    end
+endmodule
+
+module test_bench;
+    reg clk;
+    reg reset;
+    wire [7:0] count;
+
+    counter uut (
+        .clk(clk),
+        .reset(reset),
+        .count(count)
+    );
+
+    task run_test;
+        begin
+            #10 reset = 0;
+            #50 $finish;
+        end
+    endtask
+
+    function [7:0] double_value;
+        input [7:0] val;
+        begin
+            double_value = val * 2;
+        end
+    endfunction
+endmodule
+        "#;
+
+        let parsed = parser.parse_file(Path::new("test.v"), content).unwrap();
+        assert_eq!(parsed.language, "verilog");
+        assert!(!parsed.symbols.is_empty());
+
+        let names: Vec<_> = parsed.symbols.iter().map(|s| &s.name).collect();
+        assert!(
+            names.contains(&&"counter".to_string()),
+            "Should find module counter"
+        );
+        assert!(
+            names.contains(&&"test_bench".to_string()),
+            "Should find module test_bench"
+        );
+        assert!(names.contains(&&"run_test".to_string()), "Should find task");
+        assert!(
+            names.contains(&&"double_value".to_string()),
+            "Should find function"
+        );
     }
 }
