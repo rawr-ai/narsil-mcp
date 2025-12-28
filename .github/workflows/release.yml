@@ -73,12 +73,14 @@ jobs:
       - name: Run tests
         run: cargo test --features "native,neural" --verbose -- --test-threads=1
 
-  # Publish to crates.io
+  # Publish to crates.io (skip for pre-release versions)
   publish:
     name: Publish to crates.io
     runs-on: ubuntu-latest
     needs: [lint, security, test]
     timeout-minutes: 20
+    # Only publish to crates.io for stable releases (not beta, alpha, rc, etc.)
+    if: "!contains(github.ref, '-beta') && !contains(github.ref, '-alpha') && !contains(github.ref, '-rc')"
     steps:
       - uses: actions/checkout@v4
 
