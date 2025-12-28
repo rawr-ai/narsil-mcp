@@ -125,21 +125,20 @@ jobs:
           # Get version from tag (remove 'v' prefix)
           VERSION=${GITHUB_REF#refs/tags/v}
 
+          # Get absolute path to release-assets directory
+          RELEASE_DIR="$(pwd)/release-assets"
+
           for dir in artifacts/*/; do
             artifact_name=$(basename "$dir")
 
             if [[ "$artifact_name" == *"windows"* ]]; then
               # Windows: Create .zip
-              cd "$dir"
-              zip "../release-assets/narsil-mcp-v${VERSION}-${artifact_name#narsil-mcp-}.zip" narsil-mcp.exe
-              cd -
+              (cd "$dir" && zip "${RELEASE_DIR}/narsil-mcp-v${VERSION}-${artifact_name#narsil-mcp-}.zip" narsil-mcp.exe)
               # Generate SHA256
               (cd release-assets && shasum -a 256 "narsil-mcp-v${VERSION}-${artifact_name#narsil-mcp-}.zip" > "narsil-mcp-v${VERSION}-${artifact_name#narsil-mcp-}.zip.sha256")
             else
               # Unix: Create .tar.gz
-              cd "$dir"
-              tar -czf "../release-assets/narsil-mcp-v${VERSION}-${artifact_name#narsil-mcp-}.tar.gz" narsil-mcp
-              cd -
+              (cd "$dir" && tar -czf "${RELEASE_DIR}/narsil-mcp-v${VERSION}-${artifact_name#narsil-mcp-}.tar.gz" narsil-mcp)
               # Generate SHA256
               (cd release-assets && shasum -a 256 "narsil-mcp-v${VERSION}-${artifact_name#narsil-mcp-}.tar.gz" > "narsil-mcp-v${VERSION}-${artifact_name#narsil-mcp-}.tar.gz.sha256")
             fi
