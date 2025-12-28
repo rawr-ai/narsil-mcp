@@ -41,7 +41,13 @@ fn test_default_config_loads() {
     std::env::remove_var("NARSIL_DISABLED_TOOLS");
     std::env::remove_var("NARSIL_CONFIG_PATH");
 
-    let loader = ConfigLoader::new();
+    // Set paths to non-existent files to ensure we only load the default config
+    let nonexistent_user_path = PathBuf::from("/tmp/nonexistent_user_config_12345.yaml");
+    let nonexistent_project_path = PathBuf::from("/tmp/nonexistent_project_config_12345.yaml");
+
+    let loader = ConfigLoader::new()
+        .with_user_config_path(Some(nonexistent_user_path))
+        .with_project_config_path(Some(nonexistent_project_path));
     let config = loader.load().unwrap();
 
     assert_eq!(config.version, "1.0");

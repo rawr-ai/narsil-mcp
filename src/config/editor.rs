@@ -110,7 +110,8 @@ fn get_claude_desktop_config_path() -> PathBuf {
 }
 
 fn get_claude_code_config_path() -> PathBuf {
-    if let Some(home) = std::env::var_os("HOME") {
+    // Check HOME (Unix) or USERPROFILE (Windows)
+    if let Some(home) = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")) {
         PathBuf::from(home)
             .join(".claude")
             .join("claude_code_config.json")
