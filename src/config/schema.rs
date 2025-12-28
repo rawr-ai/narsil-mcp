@@ -11,7 +11,7 @@ fn default_version() -> String {
 }
 
 /// Main configuration structure
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolConfig {
     /// Configuration version (currently "1.0")
     #[serde(default = "default_version")]
@@ -35,6 +35,19 @@ pub struct ToolConfig {
     /// Feature flag requirements (optional)
     #[serde(default)]
     pub feature_requirements: HashMap<String, serde_json::Value>,
+}
+
+impl Default for ToolConfig {
+    fn default() -> Self {
+        Self {
+            version: default_version(),
+            preset: None,
+            editors: HashMap::new(),
+            tools: ToolsConfig::default(),
+            performance: PerformanceConfig::default(),
+            feature_requirements: HashMap::new(),
+        }
+    }
 }
 
 /// Tools configuration (categories and overrides)
