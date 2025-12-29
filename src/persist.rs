@@ -80,8 +80,17 @@ impl PersistedIndex {
     pub fn save(&self, path: &Path) -> Result<()> {
         let data = bincode::serialize(self).context("Failed to serialize index")?;
 
-        // Write to temp file then rename for atomicity
-        let temp_path = path.with_extension("tmp");
+        // Write to a unique temp file then rename for atomicity.
+        // Using a fixed temp path is unsafe if multiple processes share the same index directory.
+        let suffix = {
+            let pid = std::process::id();
+            let ts = SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos();
+            format!("tmp.{}.{}", pid, ts)
+        };
+        let temp_path = path.with_extension(suffix);
         std::fs::write(&temp_path, &data).context("Failed to write temp index")?;
         std::fs::rename(&temp_path, path).context("Failed to rename index file")?;
 

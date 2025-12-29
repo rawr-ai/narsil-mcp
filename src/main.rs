@@ -103,6 +103,10 @@ struct ServerArgs {
     #[arg(short, long)]
     persist: bool,
 
+    /// Enable index persistence in read-only mode (load from disk but never write)
+    #[arg(long)]
+    persist_readonly: bool,
+
     /// Enable LSP integration for enhanced code intelligence (requires language servers installed)
     #[arg(long)]
     lsp: bool,
@@ -234,7 +238,8 @@ async fn main() -> Result<()> {
     let options = index::EngineOptions {
         git_enabled: server_args.git,
         call_graph_enabled: server_args.call_graph,
-        persist_enabled: server_args.persist,
+        persist_enabled: server_args.persist || server_args.persist_readonly,
+        persist_readonly: server_args.persist_readonly,
         watch_enabled: server_args.watch,
         streaming_config,
         lsp_config,

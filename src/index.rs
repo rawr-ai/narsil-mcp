@@ -70,6 +70,8 @@ pub struct EngineOptions {
     pub call_graph_enabled: bool,
     /// Enable index persistence to disk
     pub persist_enabled: bool,
+    /// Enable index persistence in read-only mode (load only, never write)
+    pub persist_readonly: bool,
     /// Enable file watching for incremental updates
     pub watch_enabled: bool,
     /// Streaming configuration
@@ -405,7 +407,7 @@ impl CodeIntelEngine {
 
         // Persist the freshly-built index so restarts can load from disk.
         // Note: save failures should not crash the server; log and continue.
-        if self.options.persist_enabled {
+        if self.options.persist_enabled && !self.options.persist_readonly {
             match self.save_index().await {
                 Ok(msg) => info!("{}", msg),
                 Err(e) => warn!("Failed to persist index after initialization: {}", e),
@@ -489,7 +491,10 @@ impl CodeIntelEngine {
                 if let Err(e) = call_graph.build_from_files(&trees_for_callgraph) {
                     warn!("Failed to build call graph for {}: {}", repo_name, e);
                 } else {
-                    info!("Call graph built from persisted repo files for {}", repo_name);
+                    info!(
+                        "Call graph built from persisted repo files for {}",
+                        repo_name
+                    );
                 }
             }
         }
@@ -516,9 +521,15 @@ impl CodeIntelEngine {
                 let items: Vec<(crate::neural::NeuralDocument,)> =
                     neural_docs.into_iter().map(|d| (d,)).collect();
                 if let Err(e) = neural.index_batch(&items) {
-                    warn!("Failed to rebuild neural embeddings for {}: {}", repo_name, e);
+                    warn!(
+                        "Failed to rebuild neural embeddings for {}: {}",
+                        repo_name, e
+                    );
                 } else {
-                    info!("Neural embeddings rebuilt from persisted symbols for {}", repo_name);
+                    info!(
+                        "Neural embeddings rebuilt from persisted symbols for {}",
+                        repo_name
+                    );
                 }
             }
         }
@@ -750,7 +761,7 @@ impl CodeIntelEngine {
         self.embedding_engine.clear();
         self.index_repos().await?;
 
-        if self.options.persist_enabled {
+        if self.options.persist_enabled && !self.options.persist_readonly {
             let _ = self.save_index().await?;
         }
 
@@ -765,7 +776,7 @@ impl CodeIntelEngine {
                 self.symbols.remove(name);
                 self.index_repo(&path).await?;
 
-                if self.options.persist_enabled {
+                if self.options.persist_enabled && !self.options.persist_readonly {
                     let _ = self.save_index().await?;
                 }
                 Ok(format!("Re-indexed repository: {}", name))
@@ -1487,6 +1498,9 @@ impl CodeIntelEngine {
                 "Persistence is not enabled. Start with --persist flag to enable.".to_string(),
             );
         }
+        if self.options.persist_readonly {
+            return Ok("Persistence is enabled in read-only mode; skipping save.".to_string());
+        }
 
         let store = match &self.index_store {
             Some(s) => s,
@@ -1777,7 +1791,7 @@ impl CodeIntelEngine {
         }
 
         // Save index if persistence is enabled
-        if self.options.persist_enabled && count > 0 {
+        if self.options.persist_enabled && !self.options.persist_readonly && count > 0 {
             let _ = self.save_index().await;
         }
 
