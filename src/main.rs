@@ -274,6 +274,10 @@ async fn main() -> Result<()> {
     });
 
     // Start watch mode in background if enabled
+    // Keep the shutdown sender alive for the lifetime of the process; if all
+    // senders are dropped, the receiver resolves immediately and the watch task
+    // exits right away.
+    let mut _watch_shutdown_tx: Option<tokio::sync::broadcast::Sender<()>> = None;
     if server_args.watch {
         let watch_engine = Arc::clone(&engine);
 
@@ -284,8 +288,8 @@ async fn main() -> Result<()> {
             run_watch_mode(watch_engine, shutdown_rx).await;
         });
 
-        // Store shutdown sender for potential cleanup (not used currently but available for future)
-        drop(shutdown_tx);
+        // Store shutdown sender for potential cleanup (not used currently but must be kept alive)
+        _watch_shutdown_tx = Some(shutdown_tx);
     }
 
     // Start HTTP server if enabled

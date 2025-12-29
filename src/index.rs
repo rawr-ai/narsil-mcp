@@ -144,6 +144,14 @@ impl CodeIntelEngine {
         let expanded_repos: Vec<PathBuf> = repo_paths
             .iter()
             .map(|p| expand_path(p).unwrap_or_else(|_| p.clone()))
+            // Canonicalize to improve consistency across watchers/backends (e.g. /tmp vs /private/tmp on macOS)
+            .map(|p| {
+                if p.exists() {
+                    std::fs::canonicalize(&p).unwrap_or(p)
+                } else {
+                    p
+                }
+            })
             .collect();
 
         // Initialize index store for persistence if enabled
@@ -346,7 +354,13 @@ impl CodeIntelEngine {
 
             // Check if already loaded from persistence
             if self.repos.contains_key(&repo_name) {
-                info!("Repository {} already loaded from cache", repo_name);
+                info!(
+                    "Repository {} loaded from cache; hydrating volatile indexes",
+                    repo_name
+                );
+                if let Err(e) = self.hydrate_cached_repo(repo_path).await {
+                    warn!("Failed to hydrate cached repo {}: {}", repo_name, e);
+                }
                 self.indexed_repos_count.fetch_add(1, Ordering::Release);
                 continue;
             }
@@ -388,6 +402,126 @@ impl CodeIntelEngine {
 
         self.initialization_complete.store(true, Ordering::Release);
         info!("Background initialization complete");
+
+        // Persist the freshly-built index so restarts can load from disk.
+        // Note: save failures should not crash the server; log and continue.
+        if self.options.persist_enabled {
+            match self.save_index().await {
+                Ok(msg) => info!("{}", msg),
+                Err(e) => warn!("Failed to persist index after initialization: {}", e),
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Hydrate in-memory indexes for a repository that was loaded from disk persistence.
+    ///
+    /// Persistence currently stores symbols and basic file metadata, but several in-memory
+    /// structures (file cache, search index, embedding indexes, call graph) are rebuilt at runtime.
+    /// This method rebuilds those structures without re-writing symbols/metadata.
+    async fn hydrate_cached_repo(&self, repo_root: &Path) -> Result<()> {
+        let repo_name = repo_root
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("unknown")
+            .to_string();
+
+        // Rebuild TF-IDF embedding engine from persisted symbols/signatures.
+        if let Some(symbols) = self.symbols.get(&repo_name) {
+            for sym in symbols.iter() {
+                if let Some(ref sig) = sym.signature {
+                    let symbol_id = format!("{}::{}", sym.file_path, sym.name);
+                    self.embedding_engine.index_snippet(
+                        symbol_id.clone(),
+                        sym.file_path.clone(),
+                        sig.clone(),
+                        sym.start_line,
+                        sym.end_line,
+                    );
+                }
+            }
+        }
+
+        // Rebuild file cache + lexical search index from disk contents.
+        // Use ignore crate to respect .gitignore, consistent with indexing.
+        let walker = ignore::WalkBuilder::new(repo_root)
+            .hidden(true)
+            .git_ignore(true)
+            .git_global(true)
+            .git_exclude(true)
+            .build();
+
+        let mut trees_for_callgraph: Vec<(String, String, tree_sitter::Tree)> = Vec::new();
+
+        for entry in walker.filter_map(|e| e.ok()) {
+            if !entry.file_type().map(|ft| ft.is_file()).unwrap_or(false) {
+                continue;
+            }
+            let file_path = entry.path();
+            let Ok(content) = std::fs::read_to_string(file_path) else {
+                continue;
+            };
+
+            let rel_path = file_path
+                .strip_prefix(repo_root)
+                .unwrap_or(file_path)
+                .to_string_lossy()
+                .to_string();
+
+            self.file_cache
+                .insert(file_path.to_path_buf(), Arc::new(content.clone()));
+            self.search_index.index_file(&rel_path, &content);
+
+            if self.options.call_graph_enabled {
+                if let Ok(parsed) = self.parser.parse_file(file_path, &content) {
+                    if let Some(tree) = parsed.tree {
+                        trees_for_callgraph.push((rel_path, content, tree));
+                    }
+                }
+            }
+        }
+
+        // Rebuild call graph if enabled.
+        if self.options.call_graph_enabled {
+            self.call_graphs.insert(repo_name.clone(), CallGraph::new());
+            if let Some(call_graph) = self.call_graphs.get(&repo_name) {
+                if let Err(e) = call_graph.build_from_files(&trees_for_callgraph) {
+                    warn!("Failed to build call graph for {}: {}", repo_name, e);
+                } else {
+                    info!("Call graph built from persisted repo files for {}", repo_name);
+                }
+            }
+        }
+
+        // Rebuild neural embeddings if enabled (best-effort; errors shouldn't crash startup).
+        if let Some(ref neural) = self.neural_engine {
+            let mut neural_docs: Vec<crate::neural::NeuralDocument> = Vec::new();
+            if let Some(symbols) = self.symbols.get(&repo_name) {
+                for sym in symbols.iter() {
+                    if let Some(ref sig) = sym.signature {
+                        let symbol_id = format!("{}::{}", sym.file_path, sym.name);
+                        neural_docs.push(crate::neural::NeuralDocument {
+                            id: symbol_id,
+                            file_path: sym.file_path.clone(),
+                            content: sig.clone(),
+                            start_line: sym.start_line,
+                            end_line: sym.end_line,
+                            symbol_name: Some(sym.name.clone()),
+                        });
+                    }
+                }
+            }
+            if !neural_docs.is_empty() {
+                let items: Vec<(crate::neural::NeuralDocument,)> =
+                    neural_docs.into_iter().map(|d| (d,)).collect();
+                if let Err(e) = neural.index_batch(&items) {
+                    warn!("Failed to rebuild neural embeddings for {}: {}", repo_name, e);
+                } else {
+                    info!("Neural embeddings rebuilt from persisted symbols for {}", repo_name);
+                }
+            }
+        }
 
         Ok(())
     }
@@ -614,7 +748,13 @@ impl CodeIntelEngine {
         self.file_cache.clear();
         self.search_index.clear();
         self.embedding_engine.clear();
-        self.index_repos().await
+        self.index_repos().await?;
+
+        if self.options.persist_enabled {
+            let _ = self.save_index().await?;
+        }
+
+        Ok(())
     }
 
     pub async fn reindex(&self, repo: Option<&str>) -> Result<String> {
@@ -624,6 +764,10 @@ impl CodeIntelEngine {
                 self.repos.remove(name);
                 self.symbols.remove(name);
                 self.index_repo(&path).await?;
+
+                if self.options.persist_enabled {
+                    let _ = self.save_index().await?;
+                }
                 Ok(format!("Re-indexed repository: {}", name))
             }
             None => {
@@ -1545,8 +1689,25 @@ impl CodeIntelEngine {
         let mut count = 0;
 
         for change in changes {
+            // notify can yield relative paths on some platforms/backends.
+            // Normalize to an absolute path so repo routing works reliably.
+            let change_path = if change.path.is_absolute() {
+                change.path.clone()
+            } else {
+                let mut resolved: Option<PathBuf> = None;
+                for root in &self.repo_paths {
+                    let candidate = root.join(&change.path);
+                    // For deleted files the path may not exist; still accept the join.
+                    if candidate.exists() || matches!(change.change_type, ChangeType::Deleted) {
+                        resolved = Some(candidate);
+                        break;
+                    }
+                }
+                resolved.unwrap_or_else(|| change.path.clone())
+            };
+
             // Find which repo this file belongs to
-            let repo_path = self.repo_paths.iter().find(|p| change.path.starts_with(p));
+            let repo_path = self.repo_paths.iter().find(|p| change_path.starts_with(p));
 
             let repo_path = match repo_path {
                 Some(p) => p,
@@ -1562,12 +1723,11 @@ impl CodeIntelEngine {
             match change.change_type {
                 ChangeType::Created | ChangeType::Modified => {
                     // Re-index the changed file
-                    if let Ok(content) = std::fs::read_to_string(&change.path) {
-                        if let Ok(parsed) = self.parser.parse_file(&change.path, &content) {
-                            let rel_path = change
-                                .path
+                    if let Ok(content) = std::fs::read_to_string(&change_path) {
+                        if let Ok(parsed) = self.parser.parse_file(&change_path, &content) {
+                            let rel_path = change_path
                                 .strip_prefix(repo_path)
-                                .unwrap_or(&change.path)
+                                .unwrap_or(&change_path)
                                 .to_string_lossy()
                                 .to_string();
 
@@ -1585,7 +1745,7 @@ impl CodeIntelEngine {
 
                             // Update file cache
                             self.file_cache
-                                .insert(change.path.clone(), Arc::new(content.clone()));
+                                .insert(change_path.clone(), Arc::new(content.clone()));
 
                             // Update search index
                             self.search_index.index_file(&rel_path, &content);
@@ -1596,10 +1756,9 @@ impl CodeIntelEngine {
                     }
                 }
                 ChangeType::Deleted => {
-                    let rel_path = change
-                        .path
+                    let rel_path = change_path
                         .strip_prefix(repo_path)
-                        .unwrap_or(&change.path)
+                        .unwrap_or(&change_path)
                         .to_string_lossy()
                         .to_string();
 
@@ -1609,7 +1768,7 @@ impl CodeIntelEngine {
                     }
 
                     // Remove from file cache
-                    self.file_cache.remove(&change.path);
+                    self.file_cache.remove(&change_path);
 
                     info!("Removed file from index: {}", rel_path);
                     count += 1;
