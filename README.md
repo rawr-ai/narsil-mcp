@@ -9,6 +9,32 @@
 
 A Rust-powered MCP (Model Context Protocol) server providing AI assistants with deep code understanding through 76 specialized tools.
 
+## Fork (rawr-ai)
+
+This is a fork of https://github.com/postrv/narsil-mcp.
+
+High-level changes in this fork:
+- Fix `--watch` so it stays running and responds to file changes.
+- Make `--persist` save on initial index and reindex, and warm-start by hydrating in-memory indexes from the persisted data.
+- Improve watch path normalization (notably on macOS) by canonicalizing repo roots and normalizing change paths.
+
+Keeping the fork in sync with upstream:
+```bash
+git remote add upstream https://github.com/postrv/narsil-mcp
+git fetch upstream
+git merge upstream/main
+```
+
+Rebuilding (including embedded visualization UI):
+```bash
+cd frontend
+npm ci
+npm run build
+
+cd ..
+cargo build --release --features frontend
+```
+
 ## Why narsil-mcp?
 
 | Feature | narsil-mcp | XRAY | Serena | GitHub MCP |
