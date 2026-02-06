@@ -719,6 +719,22 @@ See:
 - [Codex Shared Daemon Playbook](docs/playbooks/integrations/codex-daemon.md)
 - [Docker Daemon (Optional)](docs/playbooks/integrations/docker-daemon.md)
 
+Operator commands:
+
+```bash
+# List all current-user narsil-mcp processes (daemon + stdio)
+./scripts/list-instances.sh
+
+# Dry-run shutdown
+./scripts/shutdown-all.sh --dry-run
+
+# Shut down all current-user narsil-mcp processes
+./scripts/shutdown-all.sh
+
+# Targeted shutdown by repo path fragment
+./scripts/shutdown-all.sh --repo /absolute/path/to/repo
+```
+
 ### Playbooks & Tutorials
 
 See **[docs/playbooks](docs/playbooks/)** for practical usage guides:

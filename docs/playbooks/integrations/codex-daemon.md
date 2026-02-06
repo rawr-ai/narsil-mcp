@@ -36,6 +36,30 @@ Stop:
 ./scripts/stop-daemon.sh
 ```
 
+List all current-user `narsil-mcp` instances (daemon + stdio):
+
+```bash
+./scripts/list-instances.sh
+```
+
+Shut down all current-user `narsil-mcp` instances:
+
+```bash
+./scripts/shutdown-all.sh
+```
+
+Dry-run shutdown (no signals sent):
+
+```bash
+./scripts/shutdown-all.sh --dry-run
+```
+
+Shut down only matching repo path fragments:
+
+```bash
+./scripts/shutdown-all.sh --repo /absolute/path/to/repo-a
+```
+
 Default endpoint:
 
 - `http://127.0.0.1:12006/mcp`
