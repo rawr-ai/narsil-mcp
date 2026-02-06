@@ -434,7 +434,14 @@ narsil-mcp config export > my-config.yaml
 
 ### Visualization Frontend
 
-Explore call graphs, imports, symbol references, and control flow interactively in your browser.
+narsil-mcp includes an optional web-based visualization frontend for exploring call graphs, import dependencies, and code structure interactively.
+
+`--http` starts the visualization/API server.  
+`--mcp-http` starts MCP protocol over HTTP (for shared daemon clients).
+
+**Option 1: Embedded Frontend (Recommended)**
+
+Build with the `frontend` feature to embed the visualization UI in the binary:
 
 ```bash
 # Build with embedded frontend
@@ -681,6 +688,37 @@ Ralph gracefully degrades when narsil-mcp is unavailable - all core automation f
 
 > **Documentation:** See [Ralph README](https://github.com/postrv/ralphing-la-vida-locum) for full integration details.
 
+### Shared Daemon Mode (Codex / URL Transport)
+
+For lower memory usage across multiple sessions, run one shared daemon and connect clients by URL instead of spawning a new stdio process per session.
+
+```bash
+# Start a shared daemon on http://127.0.0.1:12006/mcp
+narsil-mcp \
+  --repos ~/project-a \
+  --repos ~/project-b \
+  --persist \
+  --git \
+  --call-graph \
+  --mcp-http \
+  --mcp-http-host 127.0.0.1 \
+  --mcp-http-port 12006 \
+  --mcp-http-path /mcp
+```
+
+Codex config (`~/.codex-rawr/config.toml`):
+
+```toml
+[mcp_servers.narsil-code-intel]
+url = "http://127.0.0.1:12006/mcp"
+startup_timeout_sec = 30
+```
+
+See:
+
+- [Codex Shared Daemon Playbook](docs/playbooks/integrations/codex-daemon.md)
+- [Docker Daemon (Optional)](docs/playbooks/integrations/docker-daemon.md)
+
 ### Playbooks & Tutorials
 
 See **[docs/playbooks](docs/playbooks/)** for practical usage guides:
@@ -720,7 +758,7 @@ const symbols = client.findSymbols('Handler');
 
 | Tool | Description |
 |------|-------------|
-| `list_repos` | List all indexed repositories with metadata |
+| `list_repos` | List indexed repositories with stable repo IDs and metadata |
 | `get_project_structure` | Get directory tree with file icons and sizes |
 | `get_file` | Get file contents with optional line range |
 | `get_excerpt` | Extract code around specific lines with context |

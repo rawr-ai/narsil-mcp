@@ -57,8 +57,10 @@ Setup guides for each supported platform:
 
 - [Claude Desktop](integrations/claude-desktop.md)
 - [Claude Code (CLI)](integrations/claude-code.md)
+- [Codex Shared Daemon](integrations/codex-daemon.md)
 - [VS Code with Copilot](integrations/vscode-copilot.md)
 - [Cursor](integrations/cursor.md)
+- [Docker Daemon (Optional)](integrations/docker-daemon.md)
 
 ## Common Questions
 

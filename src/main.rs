@@ -22,6 +22,7 @@ mod incremental;
 mod index;
 mod lsp;
 mod mcp;
+mod mcp_http;
 mod metrics;
 mod neural;
 mod parser;
@@ -149,6 +150,22 @@ struct ServerArgs {
     #[arg(long, default_value = "3000")]
     http_port: u16,
 
+    /// Enable MCP over HTTP transport (shared daemon mode)
+    #[arg(long)]
+    mcp_http: bool,
+
+    /// MCP HTTP bind host (default: 127.0.0.1)
+    #[arg(long, default_value = "127.0.0.1")]
+    mcp_http_host: String,
+
+    /// MCP HTTP port (default: 12006)
+    #[arg(long, default_value = "12006")]
+    mcp_http_port: u16,
+
+    /// MCP HTTP endpoint path (default: /mcp)
+    #[arg(long, default_value = "/mcp")]
+    mcp_http_path: String,
+
     /// Tool preset (minimal, balanced, full, security-focused)
     /// Overrides the preset from config file
     #[arg(long)]
@@ -241,8 +258,20 @@ async fn main() -> Result<()> {
     let graph_available = false;
 
     info!(
-        "Features: call_graph={}, git={}, watch={}, persist={}, lsp={}, streaming={}, remote={}, neural={}, cache={}, graph={}",
-        server_args.call_graph, server_args.git, server_args.watch, server_args.persist, server_args.lsp, server_args.streaming, server_args.remote, server_args.neural, !server_args.no_cache, graph_available
+        "Features: call_graph={}, git={}, watch={}, persist={}, persist_readonly={}, lsp={}, streaming={}, remote={}, neural={}, cache={}, graph={}, http={}, mcp_http={}",
+        server_args.call_graph,
+        server_args.git,
+        server_args.watch,
+        server_args.persist,
+        server_args.persist_readonly,
+        server_args.lsp,
+        server_args.streaming,
+        server_args.remote,
+        server_args.neural,
+        !server_args.no_cache,
+        graph_available,
+        server_args.http,
+        server_args.mcp_http
     );
 
     // Build LSP config
@@ -367,23 +396,57 @@ async fn main() -> Result<()> {
         _watch_shutdown_tx = Some(shutdown_tx);
     }
 
-    // Start HTTP server in background if enabled (for visualization frontend)
-    // The MCP server still runs on stdio for editor communication
-    if server_args.http {
-        info!("Starting HTTP server on port {}", server_args.http_port);
-        let http_engine = Arc::clone(&engine);
-        let http_port = server_args.http_port;
-        tokio::spawn(async move {
-            let http_server = http_server::HttpServer::new(http_engine, http_port);
-            if let Err(e) = http_server.run().await {
-                warn!("HTTP server error: {}", e);
-            }
-        });
-    }
+    // Transport selection:
+    // - Default: MCP over stdio (for interactive/editor integrations).
+    // - Optional: visualization HTTP server (REST API + embedded frontend).
+    // - Shared daemon mode: MCP over HTTP (do NOT also run stdio; stdin would block).
+    if server_args.mcp_http {
+        if server_args.http {
+            info!(
+                "Starting HTTP visualization (port {}) and MCP HTTP ({}:{}{})",
+                server_args.http_port,
+                server_args.mcp_http_host,
+                server_args.mcp_http_port,
+                server_args.mcp_http_path
+            );
+            let vis_server =
+                http_server::HttpServer::new(Arc::clone(&engine), server_args.http_port);
+            let mcp_http_server = mcp_http::McpHttpServer::new(
+                Arc::clone(&engine),
+                server_args.mcp_http_host,
+                server_args.mcp_http_port,
+                server_args.mcp_http_path,
+            );
+            tokio::try_join!(vis_server.run(), mcp_http_server.run())?;
+        } else {
+            info!(
+                "Starting MCP HTTP server on {}:{}{}",
+                server_args.mcp_http_host, server_args.mcp_http_port, server_args.mcp_http_path
+            );
+            let mcp_http_server = mcp_http::McpHttpServer::new(
+                Arc::clone(&engine),
+                server_args.mcp_http_host,
+                server_args.mcp_http_port,
+                server_args.mcp_http_path,
+            );
+            mcp_http_server.run().await?;
+        }
+    } else {
+        if server_args.http {
+            info!("Starting HTTP visualization server on port {}", server_args.http_port);
+            let http_engine = Arc::clone(&engine);
+            let http_port = server_args.http_port;
+            tokio::spawn(async move {
+                let http_server = http_server::HttpServer::new(http_engine, http_port);
+                if let Err(e) = http_server.run().await {
+                    warn!("HTTP server error: {}", e);
+                }
+            });
+        }
 
-    // Always start the MCP server on stdio (for editor communication)
-    let server = mcp::McpServer::from_arc(engine, server_args.preset);
-    server.run().await?;
+        let server = mcp::McpServer::from_arc(Arc::clone(&engine), server_args.preset.clone());
+        server.run().await?;
+    }
 
     Ok(())
 }
