@@ -711,8 +711,17 @@ Codex config (`~/.codex-rawr/config.toml`):
 ```toml
 [mcp_servers.narsil-code-intel]
 url = "http://127.0.0.1:12006/mcp"
-startup_timeout_sec = 30
+startup_timeout_sec = 120
+
+# Optional compatibility alias; must also be URL (not command)
+[mcp_servers.narsil-code-intel-heavy]
+url = "http://127.0.0.1:12006/mcp"
+startup_timeout_sec = 120
 ```
+
+Important:
+- Do not keep `command = "...narsil-mcp"` MCP entries in Codex config if you want one shared daemon.
+- Command-based entries spawn per-session stdio processes and can reintroduce OOM pressure.
 
 See:
 
@@ -733,6 +742,19 @@ Operator commands:
 
 # Targeted shutdown by repo path fragment
 ./scripts/shutdown-all.sh --repo /absolute/path/to/repo
+```
+
+Persistent macOS daemon (launchd, recommended):
+
+```bash
+# install/update
+launchctl bootout gui/$(id -u) ~/Library/LaunchAgents/com.rawr.narsil-mcp-heavy.plist 2>/dev/null || true
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.rawr.narsil-mcp-heavy.plist
+launchctl enable gui/$(id -u)/com.rawr.narsil-mcp-heavy
+launchctl kickstart -k gui/$(id -u)/com.rawr.narsil-mcp-heavy
+
+# inspect
+launchctl print gui/$(id -u)/com.rawr.narsil-mcp-heavy
 ```
 
 ### Playbooks & Tutorials

@@ -11,7 +11,7 @@ collect_instances() {
       sub(/^ +/, "", $0);
       cmd=$0;
 
-      if (user == target_user && cmd ~ /(^|[[:space:]])([^[:space:]]*\/)?narsil-mcp([[:space:]]|$)/) {
+      if (user == target_user && cmd ~ /^([^[:space:]]*\/)?narsil-mcp([[:space:]]|$)/) {
         print pid "\t" ppid "\t" rss "\t" etime "\t" cmd;
       }
     }

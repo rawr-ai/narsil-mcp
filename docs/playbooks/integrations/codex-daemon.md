@@ -66,12 +66,17 @@ Default endpoint:
 
 ## 2) Point Codex to the shared endpoint
 
-In `~/.codex-rawr/config.toml`, prefer URL transport for this server:
+In `~/.codex-rawr/config.toml`, use URL transport (not `command`) for `narsil` entries:
 
 ```toml
 [mcp_servers.narsil-code-intel]
 url = "http://127.0.0.1:12006/mcp"
-startup_timeout_sec = 30
+startup_timeout_sec = 120
+
+# Optional compatibility alias: points to same daemon URL
+[mcp_servers.narsil-code-intel-heavy]
+url = "http://127.0.0.1:12006/mcp"
+startup_timeout_sec = 120
 ```
 
 ## 3) Use stable repo IDs
@@ -100,37 +105,53 @@ For always-on daemon usage, start conservative and add heavy features only when 
 - Add as needed: `--git`, `--call-graph`
 - Avoid by default: `--watch`, `--lsp`, `--neural`
 
-Run a separate heavy profile only for deep analysis sessions.
+If you still have any `command = "...narsil-mcp"` blocks in Codex config, Codex can spawn per-session stdio
+instances again. Keep Codex-side config URL-only and put heavy flags on the daemon process itself.
 
 ## 5) Auto-start examples
 
 ### launchd (macOS)
 
-Create `~/Library/LaunchAgents/com.narsil.mcp.plist` with:
+Canonical persistent setup: create `~/Library/LaunchAgents/com.rawr.narsil-mcp-heavy.plist` with:
 
 ```xml
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-  <key>Label</key><string>com.narsil.mcp</string>
+  <key>Label</key><string>com.rawr.narsil-mcp-heavy</string>
   <key>ProgramArguments</key>
   <array>
-    <string>/absolute/path/to/mcp-narsil/scripts/start-daemon.sh</string>
-    <string>--repos</string><string>/absolute/path/to/repo-a</string>
-    <string>--git</string>
-    <string>--call-graph</string>
+    <string>/bin/zsh</string>
+    <string>-lc</string>
+    <string>export VOYAGE_API_KEY="$(awk -F'"' '/^VOYAGE_API_KEY/ {print $2; exit}' /Users/you/.codex-rawr/config.toml)"; exec /Users/you/.cargo/bin/narsil-mcp --repos /absolute/path/to/repo-a --index-path /Users/you/.cache/narsil-mcp --persist --git --call-graph --watch --lsp --neural --neural-backend api --neural-model voyage-code-2 --mcp-http --mcp-http-host 127.0.0.1 --mcp-http-port 12006 --mcp-http-path /mcp</string>
   </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>CODEX_HOME</key><string>/Users/you/.codex-rawr</string>
+  </dict>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
+  <key>StandardOutPath</key><string>/Users/you/.cache/narsil-mcp/launchd.stdout.log</string>
+  <key>StandardErrorPath</key><string>/Users/you/.cache/narsil-mcp/launchd.stderr.log</string>
 </dict>
 </plist>
 ```
 
-Load:
+Load/reload:
 
 ```bash
-launchctl load ~/Library/LaunchAgents/com.narsil.mcp.plist
+launchctl bootout gui/$(id -u) ~/Library/LaunchAgents/com.rawr.narsil-mcp-heavy.plist 2>/dev/null || true
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.rawr.narsil-mcp-heavy.plist
+launchctl enable gui/$(id -u)/com.rawr.narsil-mcp-heavy
+launchctl kickstart -k gui/$(id -u)/com.rawr.narsil-mcp-heavy
+```
+
+Verify:
+
+```bash
+./scripts/list-instances.sh
+curl -fsS http://127.0.0.1:12006/mcp
 ```
 
 ### systemd (Linux user service)
