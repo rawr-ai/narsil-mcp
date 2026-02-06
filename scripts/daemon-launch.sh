@@ -99,7 +99,9 @@ if [[ ! -x "$NARSIL_BIN" ]]; then
 fi
 
 export NARSIL_NEURAL_REQUIRED=1
-source "$SCRIPT_DIR/resolve-daemon-env.sh" --quiet
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/resolve-daemon-env.sh"
+resolve_daemon_env --quiet
 
 cmd=("$NARSIL_BIN")
 for repo in "${repos[@]}"; do

@@ -94,7 +94,8 @@ saved_openai="${OPENAI_API_KEY-__UNSET__}"
 
 unset EMBEDDING_API_KEY VOYAGE_API_KEY OPENAI_API_KEY
 # shellcheck disable=SC1091
-source "$SCRIPT_DIR/resolve-daemon-env.sh" --quiet
+source "$SCRIPT_DIR/resolve-daemon-env.sh"
+resolve_daemon_env --quiet
 
 if [[ -n "${EMBEDDING_API_KEY:-}" || -n "${VOYAGE_API_KEY:-}" || -n "${OPENAI_API_KEY:-}" ]]; then
   key_name="EMBEDDING_API_KEY"
