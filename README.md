@@ -692,19 +692,7 @@ Ralph gracefully degrades when narsil-mcp is unavailable - all core automation f
 
 For lower memory usage across multiple sessions, run one shared daemon and connect clients by URL instead of spawning a new stdio process per session.
 
-```bash
-# Start a shared daemon on http://127.0.0.1:12006/mcp
-narsil-mcp \
-  --repos ~/project-a \
-  --repos ~/project-b \
-  --persist \
-  --git \
-  --call-graph \
-  --mcp-http \
-  --mcp-http-host 127.0.0.1 \
-  --mcp-http-port 12006 \
-  --mcp-http-path /mcp
-```
+Codex URL transport does not inject per-server env vars, so daemon credentials must come from daemon startup (not from Codex MCP server env blocks). Use `~/.config/narsil-mcp/daemon.env`.
 
 Codex config (`~/.codex-rawr/config.toml`):
 
@@ -722,6 +710,29 @@ startup_timeout_sec = 120
 Important:
 - Do not keep `command = "...narsil-mcp"` MCP entries in Codex config if you want one shared daemon.
 - Command-based entries spawn per-session stdio processes and can reintroduce OOM pressure.
+- Keep daemon credentials in `~/.config/narsil-mcp/daemon.env` and launch via scripts below.
+
+Quickstart (macOS launchd):
+
+```bash
+# 1) Create daemon credential file
+./scripts/setup-daemon-env.sh --provider voyage --key 'pa-...'
+
+# 2) Install/update persistent daemon
+./scripts/install-launchd.sh \
+  --repo /absolute/path/to/repo-a \
+  --repo /absolute/path/to/repo-b
+
+# 3) Clean restart
+./scripts/restart-daemon.sh
+
+# 4) Validate runtime + config contract
+./scripts/doctor-daemon.sh
+```
+
+`install-launchd.sh` writes:
+- `~/Library/LaunchAgents/com.rawr.narsil-mcp-heavy.plist`
+- `~/.cache/narsil-mcp/launchd-wrapper.sh` (launchd-safe startup wrapper)
 
 See:
 
@@ -742,16 +753,20 @@ Operator commands:
 
 # Targeted shutdown by repo path fragment
 ./scripts/shutdown-all.sh --repo /absolute/path/to/repo
+
+# Service lifecycle
+./scripts/start-daemon.sh
+./scripts/status-daemon.sh
+./scripts/stop-daemon.sh
+./scripts/restart-daemon.sh
+./scripts/doctor-daemon.sh
 ```
 
 Persistent macOS daemon (launchd, recommended):
 
 ```bash
-# install/update
-launchctl bootout gui/$(id -u) ~/Library/LaunchAgents/com.rawr.narsil-mcp-heavy.plist 2>/dev/null || true
-launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.rawr.narsil-mcp-heavy.plist
-launchctl enable gui/$(id -u)/com.rawr.narsil-mcp-heavy
-launchctl kickstart -k gui/$(id -u)/com.rawr.narsil-mcp-heavy
+# install/update via wrapper-managed plist
+./scripts/install-launchd.sh --repo /absolute/path/to/repo-a
 
 # inspect
 launchctl print gui/$(id -u)/com.rawr.narsil-mcp-heavy

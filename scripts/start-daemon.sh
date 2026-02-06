@@ -1,63 +1,40 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-PID_FILE="${NARSIL_MCP_PID_FILE:-$HOME/.cache/narsil-mcp/daemon.pid}"
-LOG_FILE="${NARSIL_MCP_LOG_FILE:-$HOME/.cache/narsil-mcp/daemon.log}"
+LABEL="${NARSIL_DAEMON_LABEL:-com.rawr.narsil-mcp-heavy}"
+PLIST_PATH="${NARSIL_DAEMON_PLIST:-$HOME/Library/LaunchAgents/${LABEL}.plist}"
 HOST="${NARSIL_MCP_HOST:-127.0.0.1}"
 PORT="${NARSIL_MCP_PORT:-12006}"
 PATH_ARG="${NARSIL_MCP_PATH:-/mcp}"
-INDEX_PATH="${NARSIL_MCP_INDEX_PATH:-$HOME/.cache/narsil-mcp}"
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
-mkdir -p "$(dirname "$PID_FILE")"
-mkdir -p "$(dirname "$LOG_FILE")"
+if [[ ! -f "$PLIST_PATH" ]]; then
+  echo "Launchd plist not found: $PLIST_PATH" >&2
+  echo "Install it with: ./scripts/install-launchd.sh --repo /absolute/path/to/repo" >&2
+  exit 1
+fi
 
-if [[ -f "$PID_FILE" ]]; then
-  existing_pid="$(cat "$PID_FILE")"
-  if [[ -n "$existing_pid" ]] && kill -0 "$existing_pid" 2>/dev/null; then
-    echo "narsil-mcp daemon already running (pid: $existing_pid)"
+uid="$(id -u)"
+service="gui/$uid/$LABEL"
+endpoint="http://$HOST:$PORT$PATH_ARG"
+
+if launchctl print "$service" >/dev/null 2>&1; then
+  echo "launchd service already loaded: $service"
+else
+  echo "Loading launchd service: $service"
+  launchctl bootstrap "gui/$uid" "$PLIST_PATH"
+fi
+
+launchctl enable "$service"
+launchctl kickstart "$service"
+
+echo "Waiting for MCP endpoint: $endpoint"
+for _ in {1..40}; do
+  if curl -fsS "$endpoint" >/dev/null 2>&1; then
+    echo "Daemon started and endpoint reachable."
     exit 0
   fi
-  rm -f "$PID_FILE"
-fi
+  sleep 0.25
+done
 
-if [[ "$#" -eq 0 ]]; then
-  echo "Usage: $0 --repos /path/to/repo [--repos /path/to/other] [extra narsil-mcp args...]"
-  echo "Tip: pass repo roots explicitly; avoid broad discover roots for daemon mode."
-  exit 1
-fi
-
-if [[ -n "${NARSIL_MCP_BIN:-}" ]]; then
-  cmd=("${NARSIL_MCP_BIN}")
-elif [[ -x "$REPO_ROOT/target/debug/narsil-mcp" ]]; then
-  cmd=("$REPO_ROOT/target/debug/narsil-mcp")
-elif [[ -x "$REPO_ROOT/target/release/narsil-mcp" ]]; then
-  cmd=("$REPO_ROOT/target/release/narsil-mcp")
-elif command -v cargo >/dev/null 2>&1; then
-  cmd=("cargo" "run" "--release" "--bin" "narsil-mcp" "--")
-else
-  echo "Could not find narsil-mcp binary."
-  echo "Set NARSIL_MCP_BIN=/absolute/path/to/narsil-mcp or build locally with cargo."
-  exit 1
-fi
-
-cmd+=(
-  "--mcp-http"
-  "--mcp-http-host" "$HOST"
-  "--mcp-http-port" "$PORT"
-  "--mcp-http-path" "$PATH_ARG"
-  "--index-path" "$INDEX_PATH"
-  "--persist"
-)
-
-cmd+=("$@")
-
-echo "Starting narsil-mcp daemon: ${cmd[*]}"
-nohup "${cmd[@]}" >>"$LOG_FILE" 2>&1 &
-pid=$!
-echo "$pid" > "$PID_FILE"
-
-echo "Started narsil-mcp daemon (pid: $pid)"
-echo "MCP endpoint: http://$HOST:$PORT$PATH_ARG"
-echo "Log file: $LOG_FILE"
+echo "Daemon started, but endpoint not yet reachable: $endpoint" >&2
+exit 1

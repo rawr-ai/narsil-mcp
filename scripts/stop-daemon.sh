@@ -1,38 +1,39 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-PID_FILE="${NARSIL_MCP_PID_FILE:-$HOME/.cache/narsil-mcp/daemon.pid}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+LABEL="${NARSIL_DAEMON_LABEL:-com.rawr.narsil-mcp-heavy}"
+PLIST_PATH="${NARSIL_DAEMON_PLIST:-$HOME/Library/LaunchAgents/${LABEL}.plist}"
+GRACE_SECONDS=5
 
-if [[ ! -f "$PID_FILE" ]]; then
-  echo "No PID file found at $PID_FILE"
-  exit 0
-fi
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --grace-seconds)
+      GRACE_SECONDS="$2"
+      shift 2
+      ;;
+    -h|--help)
+      echo "Usage: $0 [--grace-seconds <n>]"
+      exit 0
+      ;;
+    *)
+      echo "Unknown argument: $1" >&2
+      exit 1
+      ;;
+  esac
+done
 
-pid="$(cat "$PID_FILE")"
-if [[ -z "$pid" ]]; then
-  rm -f "$PID_FILE"
-  echo "PID file was empty; cleaned up."
-  exit 0
-fi
+uid="$(id -u)"
+service="gui/$uid/$LABEL"
 
-if kill -0 "$pid" 2>/dev/null; then
-  echo "Stopping narsil-mcp daemon (pid: $pid)..."
-  kill "$pid"
-
-  for _ in {1..20}; do
-    if ! kill -0 "$pid" 2>/dev/null; then
-      break
-    fi
-    sleep 0.2
-  done
-
-  if kill -0 "$pid" 2>/dev/null; then
-    echo "Process still running; sending SIGKILL"
-    kill -9 "$pid" || true
-  fi
+if [[ -f "$PLIST_PATH" ]]; then
+  echo "Unloading launchd service (if loaded): $service"
+  launchctl bootout "gui/$uid" "$PLIST_PATH" 2>/dev/null || true
 else
-  echo "Process $pid is not running"
+  echo "Launchd plist not found at $PLIST_PATH (continuing process cleanup)."
 fi
 
-rm -f "$PID_FILE"
+echo "Stopping remaining narsil-mcp processes..."
+"$SCRIPT_DIR/shutdown-all.sh" --grace-seconds "$GRACE_SECONDS"
+
 echo "narsil-mcp daemon stopped"

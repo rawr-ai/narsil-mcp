@@ -1,181 +1,142 @@
 # Codex Shared Daemon (OOM-Friendly)
 
-Use one long-lived `narsil-mcp` process and connect Codex via `url` transport to avoid one heavy process per session/thread.
+Use one long-lived `narsil-mcp` process and connect Codex via `url` transport so new Codex sessions do not spawn new heavy stdio servers.
 
-## Why This Helps
+## Why This Setup Is Required
 
-In stdio mode, each MCP client process launches its own `narsil-mcp` instance. If you run several Codex sessions at once, memory multiplies quickly.
+In stdio mode, each MCP client process launches its own `narsil-mcp` instance.
+With multiple sessions/threads, memory usage multiplies.
 
-Daemon mode runs one shared engine process and serves MCP over HTTP:
+In URL mode (`mcp-http`), Codex connects to a shared daemon. This prevents per-session spawning.
 
-- one index + one memory footprint,
-- multiple Codex sessions connect to the same endpoint,
-- same tools and behavior as stdio for normal request/response flows.
+Important credential rule:
 
-## 1) Start the daemon
+- Codex URL transport does **not** inject per-server env vars for `narsil-mcp`.
+- Neural API keys must be provided by the daemon launch environment.
+- Canonical location: `~/.config/narsil-mcp/daemon.env`.
 
-From this repo:
+## Canonical Runbook (macOS launchd)
+
+### 1) Create daemon env file (once)
 
 ```bash
-./scripts/start-daemon.sh \
-  --repos /absolute/path/to/repo-a \
-  --repos /absolute/path/to/repo-b \
-  --git \
-  --call-graph
+./scripts/setup-daemon-env.sh --provider voyage --key 'pa-...'
 ```
 
-Check status:
+This writes:
+
+- `~/.config/narsil-mcp/daemon.env` (mode `600`)
+
+### 2) Install/update launchd service
 
 ```bash
-./scripts/status-daemon.sh
+./scripts/install-launchd.sh \
+  --repo /absolute/path/to/repo-a \
+  --repo /absolute/path/to/repo-b
 ```
 
-Stop:
+This writes and loads:
+
+- `~/Library/LaunchAgents/com.rawr.narsil-mcp-heavy.plist`
+- `~/.cache/narsil-mcp/launchd-wrapper.sh` (launchd-safe wrapper script)
+
+The launchd wrapper runs `narsil-mcp` with daemon defaults and:
+
+- resolves credentials from `~/.config/narsil-mcp/daemon.env` (with codex config fallback),
+- starts `narsil-mcp` with heavy daemon defaults,
+- serves MCP on `http://127.0.0.1:12006/mcp`.
+
+### 3) Restart cleanly
 
 ```bash
+./scripts/restart-daemon.sh
+```
+
+`restart-daemon.sh` performs:
+
+1. unload launchd service,
+2. `shutdown-all.sh` to remove lingering `narsil-mcp` processes,
+3. bootstrap/enable/kickstart launchd,
+4. endpoint health check and single-daemon verification.
+
+### 4) Validate configuration and runtime
+
+```bash
+./scripts/doctor-daemon.sh
+```
+
+Doctor verifies:
+
+- launchd service loaded/running,
+- MCP endpoint reachable,
+- exactly one daemon-http process,
+- no stdio `narsil-mcp` processes,
+- neural key available (without printing secret),
+- Codex config URL-only with `startup_timeout_sec = 120`.
+
+## Daily Operator Commands
+
+```bash
+# Start launchd daemon
+./scripts/start-daemon.sh
+
+# Stop launchd daemon and all lingering narsil processes
 ./scripts/stop-daemon.sh
-```
 
-List all current-user `narsil-mcp` instances (daemon + stdio):
+# Restart with clean shutdown + health checks
+./scripts/restart-daemon.sh
 
-```bash
+# Service + endpoint + instance table
+./scripts/status-daemon.sh
+
+# List all current-user narsil-mcp instances (daemon + stdio)
 ./scripts/list-instances.sh
-```
 
-Shut down all current-user `narsil-mcp` instances:
-
-```bash
+# Kill all current-user narsil-mcp instances
 ./scripts/shutdown-all.sh
-```
 
-Dry-run shutdown (no signals sent):
-
-```bash
+# Preview kills only
 ./scripts/shutdown-all.sh --dry-run
+
+# Kill only matching repo command lines
+./scripts/shutdown-all.sh --repo /absolute/path/to/repo
 ```
 
-Shut down only matching repo path fragments:
+## Codex Config Contract (`~/.codex-rawr/config.toml`)
 
-```bash
-./scripts/shutdown-all.sh --repo /absolute/path/to/repo-a
-```
-
-Default endpoint:
-
-- `http://127.0.0.1:12006/mcp`
-
-## 2) Point Codex to the shared endpoint
-
-In `~/.codex-rawr/config.toml`, use URL transport (not `command`) for `narsil` entries:
+Use URL-only entries for both profiles:
 
 ```toml
 [mcp_servers.narsil-code-intel]
 url = "http://127.0.0.1:12006/mcp"
 startup_timeout_sec = 120
 
-# Optional compatibility alias: points to same daemon URL
 [mcp_servers.narsil-code-intel-heavy]
 url = "http://127.0.0.1:12006/mcp"
 startup_timeout_sec = 120
 ```
 
-## 3) Use stable repo IDs
+Do not set `command = "...narsil-mcp"` for these sections.
+That re-enables per-session stdio spawning and can reintroduce OOM pressure.
 
-`list_repos` now returns stable IDs in this format:
+## Stable Repo IDs
+
+`list_repos` returns stable repo IDs as:
 
 - `<basename>#<short_hash>`
 
-Example:
+Use `repo_id` when possible, especially with same-named repos.
 
-- `my-api#8f42c1ab`
+## Troubleshooting
 
-When two repos share the same basename, bare basename is ambiguous and rejected with candidate IDs.
+| Symptom | Likely Cause | Fix |
+|---|---|---|
+| Multiple `narsil-mcp` processes | Codex config still has command-based entries | Remove command entries; keep URL-only; run `./scripts/restart-daemon.sh` |
+| `401 Unauthorized` for neural rebuild | Daemon missing/invalid API key | Update `~/.config/narsil-mcp/daemon.env`; restart daemon |
+| Endpoint down | launchd service not loaded/running | Run `./scripts/start-daemon.sh` or reinstall with `./scripts/install-launchd.sh` |
+| Doctor fails URL/timeout checks | Config drift in `.codex-rawr/config.toml` | Set both sections to URL `http://127.0.0.1:12006/mcp` and timeout `120` |
 
-Supported repo inputs:
+## Notes
 
-- stable `repo_id` (recommended),
-- full repo path,
-- basename only when unique.
-
-## 4) Memory profile recommendations
-
-For always-on daemon usage, start conservative and add heavy features only when needed:
-
-- Keep: `--persist`
-- Add as needed: `--git`, `--call-graph`
-- Avoid by default: `--watch`, `--lsp`, `--neural`
-
-If you still have any `command = "...narsil-mcp"` blocks in Codex config, Codex can spawn per-session stdio
-instances again. Keep Codex-side config URL-only and put heavy flags on the daemon process itself.
-
-## 5) Auto-start examples
-
-### launchd (macOS)
-
-Canonical persistent setup: create `~/Library/LaunchAgents/com.rawr.narsil-mcp-heavy.plist` with:
-
-```xml
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>Label</key><string>com.rawr.narsil-mcp-heavy</string>
-  <key>ProgramArguments</key>
-  <array>
-    <string>/bin/zsh</string>
-    <string>-lc</string>
-    <string>export VOYAGE_API_KEY="$(awk -F'"' '/^VOYAGE_API_KEY/ {print $2; exit}' /Users/you/.codex-rawr/config.toml)"; exec /Users/you/.cargo/bin/narsil-mcp --repos /absolute/path/to/repo-a --index-path /Users/you/.cache/narsil-mcp --persist --git --call-graph --watch --lsp --neural --neural-backend api --neural-model voyage-code-2 --mcp-http --mcp-http-host 127.0.0.1 --mcp-http-port 12006 --mcp-http-path /mcp</string>
-  </array>
-  <key>EnvironmentVariables</key>
-  <dict>
-    <key>CODEX_HOME</key><string>/Users/you/.codex-rawr</string>
-  </dict>
-  <key>RunAtLoad</key><true/>
-  <key>KeepAlive</key><true/>
-  <key>StandardOutPath</key><string>/Users/you/.cache/narsil-mcp/launchd.stdout.log</string>
-  <key>StandardErrorPath</key><string>/Users/you/.cache/narsil-mcp/launchd.stderr.log</string>
-</dict>
-</plist>
-```
-
-Load/reload:
-
-```bash
-launchctl bootout gui/$(id -u) ~/Library/LaunchAgents/com.rawr.narsil-mcp-heavy.plist 2>/dev/null || true
-launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.rawr.narsil-mcp-heavy.plist
-launchctl enable gui/$(id -u)/com.rawr.narsil-mcp-heavy
-launchctl kickstart -k gui/$(id -u)/com.rawr.narsil-mcp-heavy
-```
-
-Verify:
-
-```bash
-./scripts/list-instances.sh
-curl -fsS http://127.0.0.1:12006/mcp
-```
-
-### systemd (Linux user service)
-
-`~/.config/systemd/user/narsil-mcp.service`:
-
-```ini
-[Unit]
-Description=narsil-mcp shared daemon
-
-[Service]
-Type=simple
-WorkingDirectory=/absolute/path/to/mcp-narsil
-ExecStart=/absolute/path/to/mcp-narsil/scripts/start-daemon.sh --repos /absolute/path/to/repo-a --git --call-graph
-ExecStop=/absolute/path/to/mcp-narsil/scripts/stop-daemon.sh
-Restart=always
-
-[Install]
-WantedBy=default.target
-```
-
-Enable:
-
-```bash
-systemctl --user daemon-reload
-systemctl --user enable --now narsil-mcp
-```
+- Docker is optional; it does not solve multi-instance spawning by itself.
+- Shared daemon + URL transport is the primary OOM mitigation path for Codex.
