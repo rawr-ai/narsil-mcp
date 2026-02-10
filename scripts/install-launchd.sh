@@ -161,11 +161,32 @@ WRAPPER_HEAD
   printf 'NARSIL_DAEMON_ENV_FILE=%q\n' "$DAEMON_ENV_FILE"
   printf 'CODEX_CONFIG_FILE=%q\n' "$CODEX_CONFIG_PATH"
   echo 'load_neural_env "$NARSIL_DAEMON_ENV_FILE" "$CODEX_CONFIG_FILE"'
-  printf 'exec %q ' "$BIN_PATH"
+  echo ''
+  echo 'declare -a REPOS_ARGS=()'
+  cat <<'REPO_HELPERS'
+maybe_add_repo() {
+  local path="$1"
+  # Treat repo roots as "optional if missing" so the daemon can be configured once
+  # and still start cleanly on fresh clones (before generated outputs exist).
+  if [[ -d "$path" ]]; then
+    REPOS_ARGS+=(--repos "$path")
+  fi
+}
+REPO_HELPERS
 
   for repo in "${repos[@]}"; do
-    printf '%q %q ' "--repos" "$repo"
+    printf 'maybe_add_repo %q\n' "$repo"
   done
+
+  cat <<'REPO_GUARD'
+if [[ ${#REPOS_ARGS[@]} -eq 0 ]]; then
+  echo "No configured repo roots exist on disk; refusing to start narsil-mcp." >&2
+  exit 1
+fi
+REPO_GUARD
+
+  printf 'exec %q ' "$BIN_PATH"
+  printf '%s ' '"${REPOS_ARGS[@]}"'
 
   printf '%q ' \
     "--index-path" "$INDEX_PATH" \

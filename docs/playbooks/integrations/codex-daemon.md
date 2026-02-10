@@ -27,7 +27,7 @@ This writes:
 
 - `~/.config/narsil-mcp/daemon.env` (mode `600`)
 
-### 2) Install/update launchd service
+### 2) Install/update launchd service (single instance)
 
 ```bash
 ./scripts/install-launchd.sh \
@@ -46,6 +46,32 @@ The launchd wrapper runs `narsil-mcp` with daemon defaults and:
 - starts `narsil-mcp` with heavy daemon defaults,
 - serves MCP on `http://127.0.0.1:12006/mcp`.
 
+### 2b) Install/update multiple daemons from one config (recommended for multi-domain)
+
+If you want **one permanent place** to define:
+
+- how many daemons exist,
+- which ports they run on,
+- which repo roots they index,
+
+use an instances config file and apply it:
+
+```bash
+# Example schema (safe to commit/share)
+cat ./configs/daemon-instances.example.toml
+
+# Your real config (recommended location)
+$EDITOR ~/.config/narsil-mcp/instances.toml
+
+# Apply config (writes plists/wrappers; restarts services by default)
+./scripts/apply-instances.py
+```
+
+Notes:
+
+- Required `repos` must exist on disk; `optional_repos` may be missing.
+- The generated launchd wrapper treats configured roots as "optional if missing" at runtime so the daemon can start before generated outputs exist.
+
 ### 3) Restart cleanly
 
 ```bash
@@ -58,6 +84,13 @@ The launchd wrapper runs `narsil-mcp` with daemon defaults and:
 2. `shutdown-all.sh` to remove lingering `narsil-mcp` processes,
 3. bootstrap/enable/kickstart launchd,
 4. endpoint health check and single-daemon verification.
+
+If you are running multiple daemons, prefer per-label launchd restarts instead of `restart-daemon.sh` (which assumes a single daemon and may stop other instances):
+
+```bash
+launchctl kickstart -k "gui/$(id -u)/com.rawr.narsil-mcp-domain-a"
+launchctl kickstart -k "gui/$(id -u)/com.rawr.narsil-mcp-domain-b"
+```
 
 ### 4) Validate configuration and runtime
 
