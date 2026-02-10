@@ -71,6 +71,10 @@ Notes:
 
 - Required `repos` must exist on disk; `optional_repos` may be missing.
 - The generated launchd wrapper treats configured roots as "optional if missing" at runtime so the daemon can start before generated outputs exist.
+- Config format choices:
+  - TOML: human-editable + commentable, and consistent with other local config (e.g. Codex `config.toml`).
+  - Python: zero-dependency glue (stdlib `tomllib`), so applying the config does not require `npm/bun install` or a build step.
+  - If you prefer Bun + TS, the config surface is intentionally simple and can be reimplemented as a TypeBox-validated script later.
 
 ### 3) Restart cleanly
 
