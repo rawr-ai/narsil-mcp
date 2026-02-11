@@ -62,6 +62,11 @@ Setup guides for each supported platform:
 - [Cursor](integrations/cursor.md)
 - [Docker Daemon (Optional)](integrations/docker-daemon.md)
 
+### Maintainer Operations
+Canonical operational runbooks for maintainers shipping fork changes:
+
+- [Narsil Maintainer Runbooks](operations/narsil-maintenance/README.md)
+
 ## Common Questions
 
 ### "Is this a plugin/agent/skill?"

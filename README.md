@@ -756,6 +756,7 @@ $EDITOR ~/.config/narsil-mcp/launcher.toml
 See:
 
 - [Codex Shared Daemon Playbook](docs/playbooks/integrations/codex-daemon.md)
+- [Narsil Maintainer Runbooks](docs/playbooks/operations/narsil-maintenance/README.md)
 - [Docker Daemon (Optional)](docs/playbooks/integrations/docker-daemon.md)
 
 Operator commands:
