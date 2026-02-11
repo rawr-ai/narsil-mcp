@@ -60,4 +60,4 @@ Use a state file in user config dir to know what was previously managed:
 - [x] Launcher config + launcherctl implemented
 - [x] Docs updated, launcher config is canonical
 - [x] Tests green
-- [ ] Merged + pushed, worktree cleaned
+- [x] Merged + pushed, worktree cleaned
