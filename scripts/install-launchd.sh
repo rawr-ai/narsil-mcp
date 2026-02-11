@@ -2,7 +2,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-LABEL="${NARSIL_DAEMON_LABEL:-com.rawr.narsil-mcp-heavy}"
+LABEL="${NARSIL_DAEMON_LABEL:-com.rawr.narsil-mcp}"
 PLIST_PATH="${NARSIL_DAEMON_PLIST:-$HOME/Library/LaunchAgents/${LABEL}.plist}"
 WRAPPER_PATH="${NARSIL_DAEMON_WRAPPER:-$HOME/.cache/narsil-mcp/launchd-wrapper.sh}"
 CODEX_HOME_PATH="${CODEX_HOME:-$HOME/.codex-rawr}"
@@ -253,6 +253,10 @@ cat > "$PLIST_TMP" <<XML
     <string>$(escape_xml "$CODEX_HOME_PATH")</string>
     <key>NARSIL_DAEMON_ENV_FILE</key>
     <string>$(escape_xml "$DAEMON_ENV_FILE")</string>
+    <key>NARSIL_LAUNCHER_MANAGED</key>
+    <string>1</string>
+    <key>NARSIL_DAEMON_LABEL</key>
+    <string>$(escape_xml "$LABEL")</string>
     <key>PATH</key>
     <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
   </dict>

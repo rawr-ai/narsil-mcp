@@ -1,0 +1,46 @@
+version = 1
+
+# Launcher config is the single source of truth for all local daemon instances.
+# Copy to:
+#   ~/.config/narsil-mcp/launcher.toml
+#
+# Then apply:
+#   ./scripts/launcherctl.py apply
+
+default_env_file = "~/.config/narsil-mcp/daemon.env"
+default_host = "127.0.0.1"
+default_path = "/mcp"
+
+# Optional. Empty means "auto-detect" (use `narsil-mcp` on PATH, or repo build output).
+default_bin = ""
+
+# Where to write LaunchAgents plists.
+default_plist_dir = "~/Library/LaunchAgents"
+
+# Base directory for per-instance index data + generated wrapper scripts.
+default_cache_root = "~/.cache/narsil-mcp"
+
+[[instances]]
+id = "domain-a"
+label = "com.rawr.narsil-mcp-domain-a"
+port = 12006
+
+# Optional: when omitted, derived as "${default_cache_root}/${id}"
+# index_path = "~/.cache/narsil-mcp/domain-a"
+
+# Required roots (must exist)
+repos = ["/absolute/path/to/repo-a"]
+
+# Optional roots (only included if they exist)
+optional_repos = ["/absolute/path/to/generated-but-useful"]
+
+# Extra args passed to the daemon. Keep this stable per instance.
+extra_args = ["--persist", "--git", "--call-graph", "--watch", "--lsp", "--neural"]
+
+[[instances]]
+id = "domain-b"
+label = "com.rawr.narsil-mcp-domain-b"
+port = 12007
+repos = ["/absolute/path/to/repo-b"]
+extra_args = ["--persist", "--git", "--call-graph", "--watch", "--lsp", "--neural"]
+

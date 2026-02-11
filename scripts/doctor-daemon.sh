@@ -2,7 +2,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-LABEL="${NARSIL_DAEMON_LABEL:-com.rawr.narsil-mcp-heavy}"
+LABEL="${NARSIL_DAEMON_LABEL:-com.rawr.narsil-mcp}"
 PLIST_PATH="${NARSIL_DAEMON_PLIST:-$HOME/Library/LaunchAgents/${LABEL}.plist}"
 HOST="${NARSIL_MCP_HOST:-127.0.0.1}"
 PORT="${NARSIL_MCP_PORT:-12006}"
@@ -50,13 +50,18 @@ else
   fail "MCP endpoint unreachable: $endpoint"
 fi
 
-daemon_count="$(ps -Ao user=,args= | awk -v target_user="$(id -un)" '
+daemon_count="$(ps -Ao user=,args= | awk -v target_user="$(id -un)" -v target_port="$PORT" '
   {
     user=$1
     $1=""
     sub(/^ +/, "", $0)
     cmd=$0
-    if (user == target_user && cmd ~ /^([^[:space:]]*\/)?narsil-mcp([[:space:]]|$)/ && cmd ~ /--mcp-http/) {
+    if (
+      user == target_user &&
+      cmd ~ /^([^[:space:]]*\/)?narsil-mcp([[:space:]]|$)/ &&
+      cmd ~ /--mcp-http/ &&
+      cmd ~ ("--mcp-http-port[[:space:]]+" target_port "([[:space:]]|$)")
+    ) {
       count++
     }
   }
@@ -77,9 +82,9 @@ stdio_count="$(ps -Ao user=,args= | awk -v target_user="$(id -un)" '
 ')"
 
 if [[ "$daemon_count" == "1" ]]; then
-  pass "exactly one daemon-http process is running"
+  pass "exactly one daemon-http process is running for port $PORT"
 else
-  fail "expected one daemon-http process, found $daemon_count"
+  fail "expected one daemon-http process for port $PORT, found $daemon_count"
 fi
 
 if [[ "$stdio_count" == "0" ]]; then
@@ -116,83 +121,55 @@ if [[ "$saved_openai" == "__UNSET__" ]]; then unset OPENAI_API_KEY; else export 
 if [[ -f "$CODEX_CONFIG" ]]; then
   pass "Codex config exists: $CODEX_CONFIG"
 
-  section_exists() {
-    local sec="$1"
-    awk -v sec="$sec" '
-      $0 ~ "^\\[mcp_servers\\." sec "\\]" { found=1; exit }
-      END { if (found) print "1"; else print "0" }
-    ' "$CODEX_CONFIG"
-  }
-
-  section_url() {
-    local sec="$1"
-    awk -v sec="$sec" '
-      $0 ~ "^\\[mcp_servers\\." sec "\\]" { in_sec=1; next }
-      in_sec && $0 ~ "^\\[" { in_sec=0 }
-      in_sec && $0 ~ /^[[:space:]]*url[[:space:]]*=/ {
-        line=$0
-        sub(/^[^=]*=[[:space:]]*/, "", line)
-        gsub(/"/, "", line)
-        gsub(/[[:space:]]+$/, "", line)
-        print line
-        exit
-      }
-    ' "$CODEX_CONFIG"
-  }
-
-  section_timeout() {
-    local sec="$1"
-    awk -v sec="$sec" '
-      $0 ~ "^\\[mcp_servers\\." sec "\\]" { in_sec=1; next }
-      in_sec && $0 ~ "^\\[" { in_sec=0 }
-      in_sec && $0 ~ /^[[:space:]]*startup_timeout_sec[[:space:]]*=/ {
-        line=$0
-        sub(/^[^=]*=[[:space:]]*/, "", line)
-        gsub(/[^0-9].*$/, "", line)
-        print line
-        exit
-      }
-    ' "$CODEX_CONFIG"
-  }
-
-  section_has_command() {
-    local sec="$1"
-    awk -v sec="$sec" '
-      $0 ~ "^\\[mcp_servers\\." sec "\\]" { in_sec=1; next }
-      in_sec && $0 ~ "^\\[" { in_sec=0 }
-      in_sec && $0 ~ /^[[:space:]]*command[[:space:]]*=/ { found=1; exit }
-      END { if (found) print "1"; else print "0" }
-    ' "$CODEX_CONFIG"
-  }
-
-  for sec in narsil-code-intel narsil-code-intel-heavy; do
-    if [[ "$(section_exists "$sec")" != "1" ]]; then
-      fail "missing section [$sec] in Codex config"
-      continue
-    fi
-
-    sec_url="$(section_url "$sec")"
-    sec_timeout="$(section_timeout "$sec")"
-    sec_has_command="$(section_has_command "$sec")"
-
-    if [[ "$sec_url" == "$endpoint" ]]; then
-      pass "[$sec] uses URL endpoint $endpoint"
+  while IFS='|' read -r status message; do
+    [[ -z "$status" ]] && continue
+    if [[ "$status" == "PASS" ]]; then
+      pass "$message"
     else
-      fail "[$sec] url mismatch (found: ${sec_url:-none})"
+      fail "$message"
     fi
+  done < <(
+    python3 - "$CODEX_CONFIG" "$endpoint" <<'PY'
+import sys
+import tomllib
+from pathlib import Path
 
-    if [[ "$sec_timeout" == "120" ]]; then
-      pass "[$sec] startup_timeout_sec is 120"
-    else
-      fail "[$sec] startup_timeout_sec is not 120 (found: ${sec_timeout:-none})"
-    fi
+cfg_path = Path(sys.argv[1])
+endpoint = sys.argv[2]
 
-    if [[ "$sec_has_command" == "0" ]]; then
-      pass "[$sec] has no command= fallback"
-    else
-      fail "[$sec] contains command= (can spawn stdio instances)"
-    fi
-  done
+try:
+    data = tomllib.loads(cfg_path.read_text(encoding="utf-8"))
+except Exception as exc:
+    print(f"FAIL|failed to parse Codex config: {exc}")
+    raise SystemExit(0)
+
+servers = data.get("mcp_servers", {})
+if not isinstance(servers, dict):
+    print("FAIL|Codex config has no [mcp_servers] table")
+    raise SystemExit(0)
+
+matches = []
+for name, cfg in servers.items():
+    if isinstance(cfg, dict) and cfg.get("url") == endpoint:
+        matches.append((name, cfg))
+
+if not matches:
+    print(f"FAIL|no [mcp_servers.*] entry points to {endpoint}")
+    raise SystemExit(0)
+
+for name, cfg in matches:
+    print(f"PASS|[{name}] uses URL endpoint {endpoint}")
+    timeout = cfg.get("startup_timeout_sec")
+    if timeout == 120:
+        print(f"PASS|[{name}] startup_timeout_sec is 120")
+    else:
+        print(f"FAIL|[{name}] startup_timeout_sec is not 120 (found: {timeout!r})")
+    if "command" in cfg:
+        print(f"FAIL|[{name}] contains command= (can spawn stdio instances)")
+    else:
+        print(f"PASS|[{name}] has no command= fallback")
+PY
+  )
 else
   fail "Codex config missing: $CODEX_CONFIG"
 fi

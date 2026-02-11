@@ -2,7 +2,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-LABEL="${NARSIL_DAEMON_LABEL:-com.rawr.narsil-mcp-heavy}"
+LABEL="${NARSIL_DAEMON_LABEL:-com.rawr.narsil-mcp}"
 PLIST_PATH="${NARSIL_DAEMON_PLIST:-$HOME/Library/LaunchAgents/${LABEL}.plist}"
 HOST="${NARSIL_MCP_HOST:-127.0.0.1}"
 PORT="${NARSIL_MCP_PORT:-12006}"
