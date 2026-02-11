@@ -98,7 +98,8 @@ impl PersistedIndex {
         let modified = metadata
             .modified()?
             .duration_since(SystemTime::UNIX_EPOCH)?
-            .as_secs();
+            .as_nanos();
+        let modified: u64 = modified.try_into().unwrap_or(u64::MAX);
         let size = metadata.len();
 
         if let Some(cached) = self.files.get(path) {
@@ -128,7 +129,9 @@ impl PersistedIndex {
                 modified_time: metadata
                     .modified()?
                     .duration_since(SystemTime::UNIX_EPOCH)?
-                    .as_secs(),
+                    .as_nanos()
+                    .try_into()
+                    .unwrap_or(u64::MAX),
                 size: metadata.len(),
                 symbols,
             },

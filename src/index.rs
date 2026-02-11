@@ -121,6 +121,7 @@ impl Default for EngineOptions {
             git_enabled: false,
             call_graph_enabled: false,
             persist_enabled: false,
+            persist_readonly: false,
             watch_enabled: false,
             streaming_config: StreamingConfig::default(),
             lsp_config: LspConfig::default(),
@@ -479,6 +480,12 @@ impl CodeIntelEngine {
                 if let Err(e) = self.hydrate_cached_repo(repo_path).await {
                     warn!("Failed to hydrate cached repo {}: {}", repo_id, e);
                 }
+                if let Err(e) = self.sync_cached_repo_with_disk(repo_path) {
+                    warn!(
+                        "Failed to sync cached repo {} with disk state: {}",
+                        repo_id, e
+                    );
+                }
                 self.indexed_repos_count.fetch_add(1, Ordering::Release);
                 continue;
             }
@@ -637,6 +644,122 @@ impl CodeIntelEngine {
         }
 
         Ok(())
+    }
+
+    /// When loading a repo from disk persistence, we still need to reconcile the persisted symbols
+    /// with the current filesystem state (new/modified/deleted files). Without this, a restart can
+    /// serve stale symbol results until watch mode catches up.
+    fn sync_cached_repo_with_disk(&self, repo_root: &Path) -> Result<usize> {
+        if !self.options.persist_enabled {
+            return Ok(0);
+        }
+
+        let Some(ref store) = self.index_store else {
+            return Ok(0);
+        };
+
+        let repo_id = repo_id_from_path(repo_root);
+        let persisted = store.load_or_create(repo_root)?;
+
+        // Collect current files (respect .gitignore, consistent with indexing).
+        let walker = ignore::WalkBuilder::new(repo_root)
+            .hidden(true)
+            .git_ignore(true)
+            .git_global(true)
+            .git_exclude(true)
+            .build();
+
+        let mut current_files: std::collections::HashSet<PathBuf> =
+            std::collections::HashSet::new();
+        for entry in walker.filter_map(|e| e.ok()) {
+            if !entry.file_type().map(|ft| ft.is_file()).unwrap_or(false) {
+                continue;
+            }
+            current_files.insert(entry.path().to_path_buf());
+        }
+
+        let mut deleted: Vec<PathBuf> = Vec::new();
+        let mut modified: Vec<PathBuf> = Vec::new();
+        for path in persisted.files.keys() {
+            if !path.exists() {
+                deleted.push(path.clone());
+                continue;
+            }
+            if persisted.needs_reindex(path)? {
+                modified.push(path.clone());
+            }
+        }
+
+        let mut created: Vec<PathBuf> = Vec::new();
+        for path in current_files.iter() {
+            if !persisted.files.contains_key(path) {
+                created.push(path.clone());
+            }
+        }
+
+        if deleted.is_empty() && modified.is_empty() && created.is_empty() {
+            return Ok(0);
+        }
+
+        if self.symbols.get(&repo_id).is_none() {
+            self.symbols.insert(repo_id.clone(), Vec::new());
+        }
+
+        let mut changed = 0usize;
+
+        // Apply deletions first.
+        if !deleted.is_empty() {
+            if let Some(mut symbols) = self.symbols.get_mut(&repo_id) {
+                for abs_path in deleted {
+                    let rel_path = abs_path
+                        .strip_prefix(repo_root)
+                        .unwrap_or(&abs_path)
+                        .to_string_lossy()
+                        .to_string();
+                    symbols.retain(|s| s.file_path != rel_path);
+                    self.query_cache.invalidate_for_file(&rel_path);
+                    changed += 1;
+                }
+            }
+        }
+
+        // Apply modifications and creations.
+        let mut to_parse = Vec::new();
+        to_parse.extend(modified);
+        to_parse.extend(created);
+
+        if let Some(mut symbols) = self.symbols.get_mut(&repo_id) {
+            for abs_path in to_parse {
+                let Ok(content) = std::fs::read_to_string(&abs_path) else {
+                    continue;
+                };
+                let Ok(parsed) = self.parser.parse_file(&abs_path, &content) else {
+                    continue;
+                };
+
+                let rel_path = abs_path
+                    .strip_prefix(repo_root)
+                    .unwrap_or(&abs_path)
+                    .to_string_lossy()
+                    .to_string();
+
+                // Remove any old symbols for this file, then replace with the newly parsed set.
+                symbols.retain(|s| s.file_path != rel_path);
+                for mut symbol in parsed.symbols {
+                    symbol.file_path = rel_path.clone();
+                    symbols.push(symbol);
+                }
+
+                self.file_cache
+                    .insert(abs_path.clone(), Arc::new(content.clone()));
+                self.search_index.index_file(&rel_path, &content);
+                self.query_cache.invalidate_for_file(&rel_path);
+
+                changed += 1;
+            }
+        }
+
+        Ok(changed)
     }
 
     /// Check if background initialization has completed
@@ -1907,7 +2030,8 @@ impl CodeIntelEngine {
                             .modified()
                             .ok()
                             .and_then(|m| m.duration_since(SystemTime::UNIX_EPOCH).ok())
-                            .map(|d| d.as_secs())
+                            .map(|d| d.as_nanos())
+                            .and_then(|n| u64::try_from(n).ok())
                             .unwrap_or(0);
 
                         let content_hash = if let Ok(content) = std::fs::read(&full_path) {
@@ -2044,11 +2168,7 @@ impl CodeIntelEngine {
                 None => continue,
             };
 
-            let repo_name = repo_path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("unknown")
-                .to_string();
+            let repo_id = repo_id_from_path(repo_path);
 
             match change.change_type {
                 ChangeType::Created | ChangeType::Modified => {
@@ -2062,7 +2182,7 @@ impl CodeIntelEngine {
                                 .to_string();
 
                             // Update symbols for this file
-                            if let Some(mut symbols) = self.symbols.get_mut(&repo_name) {
+                            if let Some(mut symbols) = self.symbols.get_mut(&repo_id) {
                                 // Remove old symbols from this file
                                 symbols.retain(|s| s.file_path != rel_path);
 
@@ -2096,7 +2216,7 @@ impl CodeIntelEngine {
                         .to_string();
 
                     // Remove symbols for this file
-                    if let Some(mut symbols) = self.symbols.get_mut(&repo_name) {
+                    if let Some(mut symbols) = self.symbols.get_mut(&repo_id) {
                         symbols.retain(|s| s.file_path != rel_path);
                     }
 
@@ -8450,14 +8570,9 @@ mod tests {
 
     fn test_options() -> EngineOptions {
         EngineOptions {
-            git_enabled: false,
-            call_graph_enabled: false,
-            persist_enabled: false,
-            persist_readonly: false,
-            watch_enabled: false,
-            streaming_config: StreamingConfig::default(),
-            lsp_config: LspConfig::default(),
-            neural_config: NeuralConfig::default(),
+            cache_enabled: false,
+            cache_ttl_seconds: 1,
+            ..EngineOptions::default()
         }
     }
 

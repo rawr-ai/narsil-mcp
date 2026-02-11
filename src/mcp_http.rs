@@ -22,6 +22,7 @@ const MCP_SESSION_ID_HEADER: &str = "mcp-session-id";
 struct McpHttpState {
     engine: Arc<CodeIntelEngine>,
     sessions: Arc<DashMap<String, Arc<McpServer>>>,
+    preset_override: Option<String>,
 }
 
 pub struct McpHttpServer {
@@ -29,15 +30,23 @@ pub struct McpHttpServer {
     host: String,
     port: u16,
     path: String,
+    preset_override: Option<String>,
 }
 
 impl McpHttpServer {
-    pub fn new(engine: Arc<CodeIntelEngine>, host: String, port: u16, path: String) -> Self {
+    pub fn new(
+        engine: Arc<CodeIntelEngine>,
+        host: String,
+        port: u16,
+        path: String,
+        preset_override: Option<String>,
+    ) -> Self {
         Self {
             engine,
             host,
             port,
             path,
+            preset_override,
         }
     }
 
@@ -46,6 +55,7 @@ impl McpHttpServer {
         let state = McpHttpState {
             engine: Arc::clone(&self.engine),
             sessions: Arc::new(DashMap::new()),
+            preset_override: self.preset_override,
         };
 
         let app = Router::new()
@@ -98,7 +108,12 @@ fn session_server(state: &McpHttpState, session_id: &str) -> Arc<McpServer> {
     state
         .sessions
         .entry(session_id.to_string())
-        .or_insert_with(|| Arc::new(McpServer::from_arc(Arc::clone(&state.engine))))
+        .or_insert_with(|| {
+            Arc::new(McpServer::from_arc(
+                Arc::clone(&state.engine),
+                state.preset_override.clone(),
+            ))
+        })
         .clone()
 }
 

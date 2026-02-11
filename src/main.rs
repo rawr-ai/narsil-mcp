@@ -416,6 +416,7 @@ async fn main() -> Result<()> {
                 server_args.mcp_http_host,
                 server_args.mcp_http_port,
                 server_args.mcp_http_path,
+                server_args.preset.clone(),
             );
             tokio::try_join!(vis_server.run(), mcp_http_server.run())?;
         } else {
@@ -428,12 +429,16 @@ async fn main() -> Result<()> {
                 server_args.mcp_http_host,
                 server_args.mcp_http_port,
                 server_args.mcp_http_path,
+                server_args.preset.clone(),
             );
             mcp_http_server.run().await?;
         }
     } else {
         if server_args.http {
-            info!("Starting HTTP visualization server on port {}", server_args.http_port);
+            info!(
+                "Starting HTTP visualization server on port {}",
+                server_args.http_port
+            );
             let http_engine = Arc::clone(&engine);
             let http_port = server_args.http_port;
             tokio::spawn(async move {
