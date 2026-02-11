@@ -2,9 +2,9 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: ['codex/integration-upstream-main']
   pull_request:
-    branches: [main]
+    branches: ['codex/integration-upstream-main']
 
 # Cancel in-progress runs for the same branch/PR
 concurrency:
@@ -95,5 +95,5 @@ jobs:
   build-release:
     name: Build Release Binaries
     needs: [test, security]
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    if: github.event_name == 'push' && github.ref == 'refs/heads/codex/integration-upstream-main'
     uses: ./.github/workflows/build-binaries.yml

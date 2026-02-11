@@ -15,7 +15,8 @@ PATH_ARG="${NARSIL_MCP_PATH:-/mcp}"
 BIN_PATH="${NARSIL_MCP_BIN:-}"
 LOAD_AFTER_INSTALL=1
 
-declare -a repos=()
+declare -a required_repos=()
+declare -a optional_repos=()
 declare -a extra_args=()
 
 usage() {
@@ -23,7 +24,8 @@ usage() {
 Usage: $0 --repo <path> [--repo <path> ...] [options]
 
 Options:
-  --repo <path>           Repo root to index (repeatable)
+  --repo <path>           Repo root to index (repeatable, REQUIRED)
+  --optional-repo <path>  Optional repo root to index if it exists (repeatable)
   --label <label>         launchd label (default: ${LABEL})
   --plist <path>          plist path (default: ${PLIST_PATH})
   --wrapper <path>        generated launchd wrapper path (default: ${WRAPPER_PATH})
@@ -43,7 +45,11 @@ USAGE
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --repo|--repos)
-      repos+=("$2")
+      required_repos+=("$2")
+      shift 2
+      ;;
+    --optional-repo)
+      optional_repos+=("$2")
       shift 2
       ;;
     --label)
@@ -107,7 +113,7 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-if [[ ${#repos[@]} -eq 0 ]]; then
+if [[ ${#required_repos[@]} -eq 0 ]]; then
   echo "At least one --repo is required." >&2
   usage
   exit 1
@@ -164,18 +170,29 @@ WRAPPER_HEAD
   echo ''
   echo 'declare -a REPOS_ARGS=()'
   cat <<'REPO_HELPERS'
-maybe_add_repo() {
+add_required_repo() {
   local path="$1"
-  # Treat repo roots as "optional if missing" so the daemon can be configured once
-  # and still start cleanly on fresh clones (before generated outputs exist).
+  if [[ ! -d "$path" ]]; then
+    echo "Required repo root missing on disk: $path" >&2
+    exit 1
+  fi
+  REPOS_ARGS+=(--repos "$path")
+}
+
+add_optional_repo() {
+  local path="$1"
   if [[ -d "$path" ]]; then
     REPOS_ARGS+=(--repos "$path")
   fi
 }
 REPO_HELPERS
 
-  for repo in "${repos[@]}"; do
-    printf 'maybe_add_repo %q\n' "$repo"
+  for repo in "${required_repos[@]}"; do
+    printf 'add_required_repo %q\n' "$repo"
+  done
+
+  for repo in "${optional_repos[@]}"; do
+    printf 'add_optional_repo %q\n' "$repo"
   done
 
   cat <<'REPO_GUARD'

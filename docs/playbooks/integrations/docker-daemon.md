@@ -1,6 +1,6 @@
 # Optional Docker Daemon Setup
 
-Docker is optional. It can improve isolation and deployment consistency, but it does **not** by itself solve multi-instance spawning. The key fix is using one shared MCP HTTP daemon and connecting clients via `url`.
+Docker is optional. It can improve isolation and deployment consistency. For Codex integration, the key is running MCP over HTTP (`--mcp-http`) and pointing clients at the daemon via `url`.
 
 ## Minimal Dockerfile
 

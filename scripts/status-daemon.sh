@@ -28,4 +28,4 @@ else
 fi
 
 echo
-"$SCRIPT_DIR/list-instances.sh"
+exit 0

@@ -18,11 +18,26 @@ High-level changes in this fork:
 - Make `--persist` save on initial index and reindex, and warm-start by hydrating in-memory indexes from the persisted data.
 - Improve watch path normalization (notably on macOS) by canonicalizing repo roots and normalizing change paths.
 
-Keeping the fork in sync with upstream:
+Fork maintenance model (Codex-style):
+- `origin` is the fork (rawr-ai)
+- `upstream` is the upstream project (postrv), fetch-only
+- `main` is a pure mirror of `upstream/main`
+- `codex/integration-upstream-main` is the long-lived shipping branch (fork patches on top of upstream)
+
+Keeping the fork in sync with upstream (high-level):
 ```bash
-git remote add upstream https://github.com/postrv/narsil-mcp
+# 1) Update mirror branch (no fork-only commits on main)
 git fetch upstream
-git merge upstream/main
+git checkout main
+git reset --hard upstream/main
+git push --force-with-lease origin main
+
+# 2) Rebase shipping branch onto the updated mirror
+git checkout codex/integration-upstream-main
+git rebase main
+
+# 3) Run tests, then push shipping branch
+git push --force-with-lease origin codex/integration-upstream-main
 ```
 
 Rebuilding (including embedded visualization UI):
@@ -718,15 +733,17 @@ Quickstart (macOS launchd):
 # 1) Create daemon credential file
 ./scripts/setup-daemon-env.sh --provider voyage --key 'pa-...'
 
-# 2) Install/update persistent daemon
-./scripts/install-launchd.sh \
-  --repo /absolute/path/to/repo-a \
-  --repo /absolute/path/to/repo-b
+# 2) Configure daemon (single source of truth)
+cp ./configs/daemon.example.toml ~/.config/narsil-mcp/daemon.toml
+$EDITOR ~/.config/narsil-mcp/daemon.toml
 
-# 3) Clean restart
+# 3) Apply config (generates plist/wrapper; loads service)
+./scripts/apply-daemon-config.py
+
+# 4) Clean restart
 ./scripts/restart-daemon.sh
 
-# 4) Validate runtime + config contract
+# 5) Validate runtime + config contract
 ./scripts/doctor-daemon.sh
 ```
 
@@ -742,18 +759,6 @@ See:
 Operator commands:
 
 ```bash
-# List all current-user narsil-mcp processes (daemon + stdio)
-./scripts/list-instances.sh
-
-# Dry-run shutdown
-./scripts/shutdown-all.sh --dry-run
-
-# Shut down all current-user narsil-mcp processes
-./scripts/shutdown-all.sh
-
-# Targeted shutdown by repo path fragment
-./scripts/shutdown-all.sh --repo /absolute/path/to/repo
-
 # Service lifecycle
 ./scripts/start-daemon.sh
 ./scripts/status-daemon.sh

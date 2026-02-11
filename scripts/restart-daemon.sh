@@ -63,11 +63,8 @@ uid="$(id -u)"
 service="gui/$uid/$LABEL"
 endpoint="http://$HOST:$PORT$PATH_ARG"
 
-echo "Stopping launchd service (if loaded): $service"
-launchctl bootout "gui/$uid" "$PLIST_PATH" 2>/dev/null || true
-
-echo "Shutting down remaining narsil-mcp processes"
-"$SCRIPT_DIR/shutdown-all.sh" --grace-seconds "$GRACE_SECONDS"
+echo "Stopping daemon"
+"$SCRIPT_DIR/stop-daemon.sh" --grace-seconds "$GRACE_SECONDS" || true
 
 echo "Starting launchd service: $service"
 launchctl bootstrap "gui/$uid" "$PLIST_PATH"
@@ -102,7 +99,6 @@ daemon_count="$(ps -Ao user=,args= | awk -v target_user="$(id -un)" '
 
 if [[ "$daemon_count" != "1" ]]; then
   echo "Expected exactly one daemon-http process after restart, found: $daemon_count" >&2
-  "$SCRIPT_DIR/list-instances.sh" || true
   exit 1
 fi
 
