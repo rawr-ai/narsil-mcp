@@ -191,9 +191,11 @@ REPO_HELPERS
     printf 'add_required_repo %q\n' "$repo"
   done
 
-  for repo in "${optional_repos[@]}"; do
-    printf 'add_optional_repo %q\n' "$repo"
-  done
+  if [[ ${optional_repos+x} && ${#optional_repos[@]} -gt 0 ]]; then
+    for repo in "${optional_repos[@]}"; do
+      printf 'add_optional_repo %q\n' "$repo"
+    done
+  fi
 
   cat <<'REPO_GUARD'
 if [[ ${#REPOS_ARGS[@]} -eq 0 ]]; then
@@ -211,7 +213,7 @@ REPO_GUARD
     "--lsp" "--neural" "--neural-backend" "api" "--neural-model" "voyage-code-2" \
     "--mcp-http" "--mcp-http-host" "$HOST" "--mcp-http-port" "$PORT" "--mcp-http-path" "$PATH_ARG"
 
-  if [[ ${#extra_args[@]} -gt 0 ]]; then
+  if [[ ${extra_args+x} && ${#extra_args[@]} -gt 0 ]]; then
     for arg in "${extra_args[@]}"; do
       printf '%q ' "$arg"
     done
