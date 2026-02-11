@@ -38,11 +38,9 @@ Use a state file in user config dir to know what was previously managed:
 1. Add `docs/notes/launcher-migration-scratchpad.md` (this file) as the first commit.
 2. Add `configs/launcher.example.toml`.
 3. Add `scripts/launcherctl.py` (`apply/status/restart/stop`).
-4. Remove single-instance surfaces:
-   - delete `configs/daemon.example.toml`
-   - delete `scripts/apply-daemon-config.py`
+4. Remove superseded single-daemon config/apply surfaces.
 5. Update docs + README:
-   - remove all `daemon.toml` references
+   - remove stale single-daemon references and make launcher config canonical
    - make launcher config canonical
    - keep examples placeholder-only
 6. Ensure `scripts/install-launchd.sh` is compatible (already supports `--optional-repo`; keep it).
@@ -52,15 +50,14 @@ Use a state file in user config dir to know what was previously managed:
 8. Non-interactive commits (small logical slices):
    - `docs: add launcher migration scratchpad`
    - `feat: add launcherctl and launcher config`
-   - `chore: remove daemon.toml surfaces`
+   - `chore: remove superseded single-daemon surfaces`
    - `docs: update daemon runbooks to launcher`
 9. Fast-forward merge into `codex/integration-upstream-main`, push.
 10. Remove worktree and delete feature branch.
 
 ## Notes / Progress
-- [ ] Scratchpad committed
-- [ ] Launcher config + launcherctl implemented
-- [ ] Docs updated, no stale `daemon.toml`
-- [ ] Tests green
+- [x] Scratchpad committed
+- [x] Launcher config + launcherctl implemented
+- [x] Docs updated, launcher config is canonical
+- [x] Tests green
 - [ ] Merged + pushed, worktree cleaned
-

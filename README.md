@@ -705,25 +705,26 @@ Ralph gracefully degrades when narsil-mcp is unavailable - all core automation f
 
 ### Shared Daemon Mode (Codex / URL Transport)
 
-For lower memory usage across multiple sessions, run one shared daemon and connect clients by URL instead of spawning a new stdio process per session.
+For lower memory usage across multiple sessions, run shared daemons and connect clients by URL instead of spawning a new stdio process per session.
+
+To keep domains isolated (especially for neural search), run one daemon **per domain** (each daemon can still index multiple roots via `--repos`).
 
 Codex URL transport does not inject per-server env vars, so daemon credentials must come from daemon startup (not from Codex MCP server env blocks). Use `~/.config/narsil-mcp/daemon.env`.
 
-Codex config (`~/.codex-rawr/config.toml`):
+Codex config (`~/.codex-rawr/config.toml`) (one per domain):
 
 ```toml
-[mcp_servers.narsil-code-intel]
+[mcp_servers.narsil-domain-a]
 url = "http://127.0.0.1:12006/mcp"
 startup_timeout_sec = 120
 
-# Optional compatibility alias; must also be URL (not command)
-[mcp_servers.narsil-code-intel-heavy]
-url = "http://127.0.0.1:12006/mcp"
+[mcp_servers.narsil-domain-b]
+url = "http://127.0.0.1:12007/mcp"
 startup_timeout_sec = 120
 ```
 
 Important:
-- Do not keep `command = "...narsil-mcp"` MCP entries in Codex config if you want one shared daemon.
+- Do not keep `command = "...narsil-mcp"` MCP entries in Codex config if you want shared daemon mode.
 - Command-based entries spawn per-session stdio processes and can reintroduce OOM pressure.
 - Keep daemon credentials in `~/.config/narsil-mcp/daemon.env` and launch via scripts below.
 
@@ -733,23 +734,24 @@ Quickstart (macOS launchd):
 # 1) Create daemon credential file
 ./scripts/setup-daemon-env.sh --provider voyage --key 'pa-...'
 
-# 2) Configure daemon (single source of truth)
-cp ./configs/daemon.example.toml ~/.config/narsil-mcp/daemon.toml
-$EDITOR ~/.config/narsil-mcp/daemon.toml
+# 2) Configure launcher (single source of truth)
+cp ./configs/launcher.example.toml ~/.config/narsil-mcp/launcher.toml
+$EDITOR ~/.config/narsil-mcp/launcher.toml
 
-# 3) Apply config (generates plist/wrapper; loads service)
-./scripts/apply-daemon-config.py
+# 3) Apply config (generates plists/wrappers; loads services)
+./scripts/launcherctl.py apply
 
 # 4) Clean restart
-./scripts/restart-daemon.sh
+./scripts/launcherctl.py restart
 
 # 5) Validate runtime + config contract
+./scripts/launcherctl.py status
 ./scripts/doctor-daemon.sh
 ```
 
-`install-launchd.sh` writes:
-- `~/Library/LaunchAgents/com.rawr.narsil-mcp-heavy.plist`
-- `~/.cache/narsil-mcp/launchd-wrapper.sh` (launchd-safe startup wrapper)
+`install-launchd.sh` writes (per instance):
+- `~/Library/LaunchAgents/<label>.plist`
+- `<index_path>/launchd-wrapper.sh` (launchd-safe startup wrapper)
 
 See:
 
@@ -760,21 +762,20 @@ Operator commands:
 
 ```bash
 # Service lifecycle
-./scripts/start-daemon.sh
-./scripts/status-daemon.sh
-./scripts/stop-daemon.sh
-./scripts/restart-daemon.sh
+./scripts/launcherctl.py status
+./scripts/launcherctl.py stop
+./scripts/launcherctl.py restart
 ./scripts/doctor-daemon.sh
 ```
 
 Persistent macOS daemon (launchd, recommended):
 
 ```bash
-# install/update via wrapper-managed plist
-./scripts/install-launchd.sh --repo /absolute/path/to/repo-a
+# install/update/reconcile all configured instances
+./scripts/launcherctl.py apply
 
-# inspect
-launchctl print gui/$(id -u)/com.rawr.narsil-mcp-heavy
+# inspect configured instances + endpoint health
+./scripts/launcherctl.py status
 ```
 
 ### Playbooks & Tutorials
