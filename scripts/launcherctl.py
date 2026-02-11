@@ -122,12 +122,13 @@ def parse_launcher_config(cfg_path: Path) -> list[InstanceConfig]:
     if version != 1:
         raise SystemExit(f"Unsupported launcher config version: {version} (expected 1)")
 
-    default_env_file = str(raw.get("default_env_file", "~/.config/narsil-mcp/daemon.env"))
+    default_env_file = expand_path(str(raw.get("default_env_file", "~/.config/narsil-mcp/daemon.env")))
     default_host = str(raw.get("default_host", "127.0.0.1"))
     default_path = str(raw.get("default_path", "/mcp"))
-    default_bin = str(raw.get("default_bin", "")).strip() or None
-    default_plist_dir = str(raw.get("default_plist_dir", "~/Library/LaunchAgents"))
-    default_cache_root = str(raw.get("default_cache_root", "~/.cache/narsil-mcp"))
+    default_bin_raw = str(raw.get("default_bin", "")).strip()
+    default_bin = expand_path(default_bin_raw) if default_bin_raw else None
+    default_plist_dir = expand_path(str(raw.get("default_plist_dir", "~/Library/LaunchAgents")))
+    default_cache_root = expand_path(str(raw.get("default_cache_root", "~/.cache/narsil-mcp")))
 
     instances_raw = raw.get("instances", [])
     if not isinstance(instances_raw, list) or not instances_raw:
@@ -149,28 +150,32 @@ def parse_launcher_config(cfg_path: Path) -> list[InstanceConfig]:
         host = str(inst.get("host", default_host))
         port = int(inst.get("port"))
         path = str(inst.get("path", default_path))
-        env_file = str(inst.get("env_file", default_env_file))
-        bin_path = str(inst.get("bin", default_bin or "")).strip() or default_bin
-        plist_dir = str(inst.get("plist_dir", default_plist_dir))
-        cache_root = str(inst.get("cache_root", default_cache_root))
+        env_file = expand_path(str(inst.get("env_file", default_env_file)))
+        bin_raw = str(inst.get("bin", default_bin or "")).strip()
+        bin_path = expand_path(bin_raw) if bin_raw else default_bin
+        plist_dir = expand_path(str(inst.get("plist_dir", default_plist_dir)))
+        cache_root = expand_path(str(inst.get("cache_root", default_cache_root)))
 
         index_path = str(inst.get("index_path", "")).strip()
         if not index_path:
             index_path = str(Path(cache_root) / inst_id)
+        index_path = expand_path(index_path)
 
         wrapper_path = str(inst.get("wrapper_path", "")).strip()
         if not wrapper_path:
             wrapper_path = str(Path(index_path) / "launchd-wrapper.sh")
+        wrapper_path = expand_path(wrapper_path)
 
         plist_path = str(inst.get("plist_path", "")).strip()
         if not plist_path:
             plist_path = str(Path(plist_dir) / f"{label}.plist")
+        plist_path = expand_path(plist_path)
 
-        repos = [str(p) for p in (inst.get("repos", []) or [])]
+        repos = [expand_path(str(p)) for p in (inst.get("repos", []) or [])]
         if not repos:
             raise SystemExit(f"Instance {inst_id}: repos must be a non-empty array")
 
-        optional_repos = [str(p) for p in (inst.get("optional_repos", []) or [])]
+        optional_repos = [expand_path(str(p)) for p in (inst.get("optional_repos", []) or [])]
         extra_args = [str(a) for a in (inst.get("extra_args", []) or [])]
 
         out.append(
@@ -385,4 +390,3 @@ def main(argv: list[str]) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main(sys.argv[1:]))
-
