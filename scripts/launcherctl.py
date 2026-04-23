@@ -98,6 +98,7 @@ class InstanceConfig:
     index_path: str
     wrapper_path: str
     plist_path: str
+    neural_model: str
     repos: list[str]
     optional_repos: list[str]
     extra_args: list[str]
@@ -127,6 +128,9 @@ def parse_launcher_config(cfg_path: Path) -> list[InstanceConfig]:
     default_path = str(raw.get("default_path", "/mcp"))
     default_bin_raw = str(raw.get("default_bin", "")).strip()
     default_bin = expand_path(default_bin_raw) if default_bin_raw else None
+    default_neural_model = str(raw.get("default_neural_model", "voyage-code-3")).strip()
+    if not default_neural_model:
+        raise SystemExit("default_neural_model must not be empty")
     default_plist_dir = expand_path(str(raw.get("default_plist_dir", "~/Library/LaunchAgents")))
     default_cache_root = expand_path(str(raw.get("default_cache_root", "~/.cache/narsil-mcp")))
 
@@ -171,6 +175,10 @@ def parse_launcher_config(cfg_path: Path) -> list[InstanceConfig]:
             plist_path = str(Path(plist_dir) / f"{label}.plist")
         plist_path = expand_path(plist_path)
 
+        neural_model = str(inst.get("neural_model", default_neural_model)).strip()
+        if not neural_model:
+            raise SystemExit(f"Instance {inst_id}: neural_model must not be empty")
+
         repos = [expand_path(str(p)) for p in (inst.get("repos", []) or [])]
         if not repos:
             raise SystemExit(f"Instance {inst_id}: repos must be a non-empty array")
@@ -192,6 +200,7 @@ def parse_launcher_config(cfg_path: Path) -> list[InstanceConfig]:
                 index_path=index_path,
                 wrapper_path=wrapper_path,
                 plist_path=plist_path,
+                neural_model=neural_model,
                 repos=repos,
                 optional_repos=optional_repos,
                 extra_args=extra_args,
@@ -290,6 +299,7 @@ def apply_instances(repo_root: Path, cfg_path: Path) -> int:
         cmd += ["--index-path", inst.index_path]
         cmd += ["--wrapper", inst.wrapper_path]
         cmd += ["--plist", inst.plist_path]
+        cmd += ["--neural-model", inst.neural_model]
 
         if inst.bin_path:
             cmd += ["--bin", inst.bin_path]

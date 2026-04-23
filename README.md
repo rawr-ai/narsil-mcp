@@ -297,7 +297,7 @@ narsil-mcp \
   --remote \        # Enable GitHub remote repo support
   --neural \        # Enable neural semantic embeddings
   --neural-backend api \  # Backend: "api" (Voyage/OpenAI) or "onnx"
-  --neural-model voyage-code-2 \  # Model to use
+  --neural-model voyage-code-3 \  # Model to use
   --neural-dimension 3072 \  # Override embedding dimensions (auto-detected per model)
   --graph           # Enable SPARQL/RDF knowledge graph and CCG tools (requires --features graph build)
 ```
@@ -499,10 +499,12 @@ narsil-mcp config init --neural
 
 # Or manually with Voyage AI
 export VOYAGE_API_KEY="your-key"
-narsil-mcp --repos ~/project --neural --neural-model voyage-code-2
+narsil-mcp --repos ~/project --neural --neural-model voyage-code-3
 ```
 
 Supports Voyage AI, OpenAI, custom endpoints, and local ONNX models.
+Changing the neural model or embedding dimension requires reindexing so stored
+embeddings are rebuilt with the new vector shape.
 
 > **Full documentation:** See [docs/neural-search.md](docs/neural-search.md) for setup, backends, and use cases.
 
@@ -737,6 +739,7 @@ Quickstart (macOS launchd):
 # 2) Configure launcher (single source of truth)
 cp ./configs/launcher.example.toml ~/.config/narsil-mcp/launcher.toml
 $EDITOR ~/.config/narsil-mcp/launcher.toml
+# Optional: set default_neural_model = "voyage-code-3" or per-instance neural_model.
 
 # 3) Apply config (generates plists/wrappers; loads services)
 ./scripts/launcherctl.py apply

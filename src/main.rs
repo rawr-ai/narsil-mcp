@@ -134,7 +134,7 @@ struct ServerArgs {
     #[arg(long, default_value = "api")]
     neural_backend: String,
 
-    /// Neural embedding model name (e.g., "voyage-code-2", "text-embedding-3-small")
+    /// Neural embedding model name (e.g., "voyage-code-3", "text-embedding-3-small")
     #[arg(long)]
     neural_model: Option<String>,
 

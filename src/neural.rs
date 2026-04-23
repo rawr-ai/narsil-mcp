@@ -41,7 +41,7 @@ pub struct NeuralConfig {
     pub model_path: Option<String>,
     /// Path to tokenizer file (for onnx backend)
     pub tokenizer_path: Option<String>,
-    /// Model name for API backend (e.g., "voyage-code-2")
+    /// Model name for API backend (e.g., "voyage-code-3")
     pub model_name: Option<String>,
     /// API endpoint (for api backend)
     pub api_endpoint: Option<String>,
@@ -60,9 +60,9 @@ impl Default for NeuralConfig {
             backend: "api".to_string(),
             model_path: None,
             tokenizer_path: None,
-            model_name: Some("voyage-code-2".to_string()),
+            model_name: Some("voyage-code-3".to_string()),
             api_endpoint: None,
-            dimension: default_dimension_for_model(Some("voyage-code-2")),
+            dimension: default_dimension_for_model(Some("voyage-code-3")),
             max_seq_length: 512,
             batch_size: 32,
         }
@@ -80,6 +80,7 @@ impl Default for NeuralConfig {
 /// ```
 /// use narsil_mcp::neural::default_dimension_for_model;
 /// assert_eq!(default_dimension_for_model(Some("text-embedding-3-large")), 3072);
+/// assert_eq!(default_dimension_for_model(Some("voyage-code-3")), 1024);
 /// assert_eq!(default_dimension_for_model(Some("voyage-code-2")), 1536);
 /// assert_eq!(default_dimension_for_model(None), 1536);
 /// ```
@@ -412,9 +413,9 @@ impl ApiEmbedder {
         Self {
             client: Self::create_secure_client(),
             endpoint: "https://api.voyageai.com/v1/embeddings".to_string(),
-            model: "voyage-code-2".to_string(),
+            model: "voyage-code-3".to_string(),
             api_key: Some(api_key.to_string()),
-            dimension: default_dimension_for_model(Some("voyage-code-2")),
+            dimension: default_dimension_for_model(Some("voyage-code-3")),
         }
     }
 
@@ -928,7 +929,7 @@ impl NeuralEngine {
                 "No embedding API key found. Set EMBEDDING_API_KEY, VOYAGE_API_KEY, or OPENAI_API_KEY"
             )?;
 
-            let model_name = config.model_name.as_deref().unwrap_or("voyage-code-2");
+            let model_name = config.model_name.as_deref().unwrap_or("voyage-code-3");
             backend = if model_name.contains("voyage") {
                 Arc::new(ApiEmbedder::custom(
                     "https://api.voyageai.com/v1/embeddings",
@@ -1134,8 +1135,9 @@ mod tests {
         let config = NeuralConfig::default();
         assert!(!config.enabled);
         assert_eq!(config.backend, "api");
-        // Default model is voyage-code-2 which has 1536 dimensions
-        assert_eq!(config.dimension, 1536);
+        assert_eq!(config.model_name.as_deref(), Some("voyage-code-3"));
+        // Default model is voyage-code-3 which has 1024 dimensions
+        assert_eq!(config.dimension, 1024);
     }
 
     #[test]
@@ -1211,7 +1213,8 @@ mod tests {
     fn test_api_embedder_creation() {
         // Test that embedders can be created with correct dimensions
         let voyage = ApiEmbedder::voyage("test-key");
-        assert_eq!(voyage.dimension, 1536);
+        assert_eq!(voyage.model, "voyage-code-3");
+        assert_eq!(voyage.dimension, 1024);
 
         let openai = ApiEmbedder::openai("test-key");
         assert_eq!(openai.dimension, 1536);
@@ -1916,10 +1919,9 @@ mod tests {
 
     #[test]
     fn test_default_dimension_matches_default_model() {
-        // NeuralConfig's default model_name is None, but the engine defaults to voyage-code-2
-        // Verify the dimensions are consistent
         let config = NeuralConfig::default();
-        // Default model is voyage-code-2 (hardcoded in NeuralConfig::default)
+        // Verify the default model and dimensions are consistent.
+        assert_eq!(config.model_name.as_deref(), Some("voyage-code-3"));
         let expected_dim = default_dimension_for_model(config.model_name.as_deref());
         assert_eq!(config.dimension, expected_dim);
     }

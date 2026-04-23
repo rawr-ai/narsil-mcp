@@ -9,17 +9,19 @@ PORT="${NARSIL_MCP_PORT:-12006}"
 PATH_ARG="${NARSIL_MCP_PATH:-/mcp}"
 INDEX_PATH="${NARSIL_MCP_INDEX_PATH:-$HOME/.cache/narsil-mcp}"
 NARSIL_BIN="${NARSIL_MCP_BIN:-}"
+NEURAL_MODEL="${NARSIL_NEURAL_MODEL:-voyage-code-3}"
 
 declare -a repos=()
 declare -a passthrough=()
 
 usage() {
   cat <<USAGE
-Usage: $0 [--repo <path>]... [--index-path <path>] [--host <host>] [--port <port>] [--path <path>] [--bin <binary>] [-- <extra narsil args>]
+Usage: $0 [--repo <path>]... [--index-path <path>] [--host <host>] [--port <port>] [--path <path>] [--bin <binary>] [--neural-model <model>] [-- <extra narsil args>]
 
 Notes:
   - Heavy daemon flags are enabled by default: --watch --lsp --neural --git --call-graph --persist
   - Repos can also be supplied via NARSIL_DAEMON_REPOS as comma-separated paths.
+  - Neural model defaults to NARSIL_NEURAL_MODEL or voyage-code-3.
 USAGE
 }
 
@@ -47,6 +49,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --bin)
       NARSIL_BIN="$2"
+      shift 2
+      ;;
+    --neural-model)
+      NEURAL_MODEL="$2"
       shift 2
       ;;
     -h|--help)
@@ -117,7 +123,7 @@ cmd+=(
   "--lsp"
   "--neural"
   "--neural-backend" "api"
-  "--neural-model" "voyage-code-2"
+  "--neural-model" "$NEURAL_MODEL"
   "--mcp-http"
   "--mcp-http-host" "$HOST"
   "--mcp-http-port" "$PORT"
