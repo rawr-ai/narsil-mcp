@@ -406,6 +406,75 @@ async fn test_async_watcher_creation() -> Result<()> {
 }
 
 #[tokio::test]
+async fn test_process_file_changes_skips_gitignored_source_files() -> Result<()> {
+    use narsil_mcp::index::{CodeIntelEngine, EngineOptions};
+    use narsil_mcp::persist::{ChangeType, FileChange};
+
+    let repo = TestRepo::new()?;
+    repo.add_rust_file("src/lib.rs", "pub fn allowed_symbol() {}")?;
+    std::fs::write(repo.path().join(".gitignore"), "node_modules/\n")?;
+
+    let ignored_path = repo.path().join("node_modules/pkg/index.rs");
+    if let Some(parent) = ignored_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(&ignored_path, "pub fn ignored_symbol() {}")?;
+
+    let index_dir = TempDir::new()?;
+    let options = EngineOptions {
+        git_enabled: false,
+        call_graph_enabled: false,
+        persist_enabled: false,
+        watch_enabled: true,
+        streaming_config: StreamingConfig::default(),
+        lsp_config: LspConfig::default(),
+        neural_config: NeuralConfig::default(),
+        ..Default::default()
+    };
+
+    let engine = CodeIntelEngine::with_options(
+        index_dir.path().to_path_buf(),
+        vec![repo.path().to_path_buf()],
+        options,
+    )
+    .await?;
+    engine.complete_initialization().await?;
+
+    let changed = engine
+        .process_file_changes(&[FileChange {
+            path: ignored_path,
+            change_type: ChangeType::Created,
+        }])
+        .await?;
+    assert_eq!(changed, 1);
+
+    let repo_name = repo.path().file_name().unwrap().to_string_lossy();
+    let ignored = engine
+        .find_symbols(
+            &repo_name,
+            Some("function"),
+            Some("ignored_symbol"),
+            None,
+            None,
+        )
+        .await?;
+    assert!(ignored.contains("Found 0 symbols"));
+
+    let allowed = engine
+        .find_symbols(
+            &repo_name,
+            Some("function"),
+            Some("allowed_symbol"),
+            None,
+            None,
+        )
+        .await?;
+    assert!(allowed.contains("allowed_symbol"));
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn test_async_watcher_disabled_when_watch_disabled() -> Result<()> {
     use narsil_mcp::index::{CodeIntelEngine, EngineOptions};
 

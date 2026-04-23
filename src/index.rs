@@ -681,7 +681,7 @@ impl CodeIntelEngine {
         let mut deleted: Vec<PathBuf> = Vec::new();
         let mut modified: Vec<PathBuf> = Vec::new();
         for path in persisted.files.keys() {
-            if !path.exists() {
+            if !path.exists() || !current_files.contains(path) {
                 deleted.push(path.clone());
                 continue;
             }
@@ -2146,7 +2146,11 @@ impl CodeIntelEngine {
             // notify can yield relative paths on some platforms/backends.
             // Normalize to an absolute path so repo routing works reliably.
             let change_path = if change.path.is_absolute() {
-                change.path.clone()
+                if change.path.exists() {
+                    std::fs::canonicalize(&change.path).unwrap_or_else(|_| change.path.clone())
+                } else {
+                    change.path.clone()
+                }
             } else {
                 let mut resolved: Option<PathBuf> = None;
                 for root in &self.repo_paths {
@@ -2172,6 +2176,22 @@ impl CodeIntelEngine {
 
             match change.change_type {
                 ChangeType::Created | ChangeType::Modified => {
+                    if !should_index_changed_file(repo_path, &change_path) {
+                        let rel_path = change_path
+                            .strip_prefix(repo_path)
+                            .unwrap_or(&change_path)
+                            .to_string_lossy()
+                            .to_string();
+
+                        if let Some(mut symbols) = self.symbols.get_mut(&repo_id) {
+                            symbols.retain(|s| s.file_path != rel_path);
+                        }
+                        self.file_cache.remove(&change_path);
+                        self.query_cache.invalidate_for_file(&rel_path);
+                        count += 1;
+                        continue;
+                    }
+
                     // Re-index the changed file
                     if let Ok(content) = std::fs::read_to_string(&change_path) {
                         if let Ok(parsed) = self.parser.parse_file(&change_path, &content) {
@@ -8365,6 +8385,78 @@ fn repo_id_from_path(path: &Path) -> String {
         hash[0], hash[1], hash[2], hash[3]
     );
     format!("{}#{}", repo_display_name(path), short_hash)
+}
+
+fn should_index_changed_file(repo_root: &Path, file_path: &Path) -> bool {
+    let Ok(relative_path) = file_path.strip_prefix(repo_root) else {
+        return false;
+    };
+
+    if relative_path.components().any(|component| {
+        matches!(
+            component,
+            std::path::Component::Normal(name)
+                if name.to_string_lossy().starts_with('.')
+        )
+    }) {
+        return false;
+    }
+
+    let mut builder = ignore::gitignore::GitignoreBuilder::new(repo_root);
+    let git_exclude = repo_root.join(".git").join("info").join("exclude");
+    if git_exclude.is_file() {
+        if let Some(err) = builder.add(&git_exclude) {
+            warn!(
+                "Failed to load git exclude file {}: {}",
+                git_exclude.display(),
+                err
+            );
+        }
+    }
+
+    let mut dirs = Vec::new();
+    let mut current = file_path.parent();
+    while let Some(dir) = current {
+        if !dir.starts_with(repo_root) {
+            break;
+        }
+        dirs.push(dir.to_path_buf());
+        if dir == repo_root {
+            break;
+        }
+        current = dir.parent();
+    }
+    dirs.reverse();
+
+    for dir in dirs {
+        let ignore_file = dir.join(".gitignore");
+        if ignore_file.is_file() {
+            if let Some(err) = builder.add(&ignore_file) {
+                warn!(
+                    "Failed to load gitignore file {}: {}",
+                    ignore_file.display(),
+                    err
+                );
+            }
+        }
+    }
+
+    let matcher = match builder.build() {
+        Ok(matcher) => matcher,
+        Err(err) => {
+            warn!(
+                "Failed to build gitignore matcher for {}: {}",
+                repo_root.display(),
+                err
+            );
+            return true;
+        }
+    };
+
+    !matches!(
+        matcher.matched_path_or_any_parents(relative_path, false),
+        ignore::Match::Ignore(_)
+    )
 }
 
 /// Validate that a requested path is within the repository root to prevent path traversal attacks
