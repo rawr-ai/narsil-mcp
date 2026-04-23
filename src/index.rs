@@ -1286,7 +1286,7 @@ impl CodeIntelEngine {
             output.push_str("- **Languages**:\n");
 
             let mut langs: Vec<_> = repo.languages.iter().collect();
-            langs.sort_by(|a, b| b.1.line_count.cmp(&a.1.line_count));
+            langs.sort_by_key(|lang| std::cmp::Reverse(lang.1.line_count));
 
             for (lang, stats) in langs {
                 output.push_str(&format!(
@@ -4446,7 +4446,7 @@ impl CodeIntelEngine {
         output.push_str("|------|-------|------------|\n");
 
         let mut types: Vec<_> = stats.by_type.into_iter().collect();
-        types.sort_by(|a, b| b.1.cmp(&a.1));
+        types.sort_by_key(|chunk_type| std::cmp::Reverse(chunk_type.1));
 
         for (chunk_type, count) in types {
             let pct = if stats.total_chunks > 0 {
@@ -5151,7 +5151,7 @@ impl CodeIntelEngine {
             .filter(|f| f.severity >= min_severity)
             .collect();
 
-        findings.sort_by(|a, b| b.severity.cmp(&a.severity));
+        findings.sort_by_key(|finding| std::cmp::Reverse(finding.severity));
 
         // Phase C2: Apply pagination (offset and limit)
         let total_findings = findings.len();
@@ -5259,7 +5259,7 @@ impl CodeIntelEngine {
             })
             .collect();
 
-        findings.sort_by(|a, b| b.severity.cmp(&a.severity));
+        findings.sort_by_key(|finding| std::cmp::Reverse(finding.severity));
 
         let mut output = format!("# OWASP Top 10 2021 Scan: {}\n\n", repo_name);
         output.push_str(&format!("**Files Scanned**: {}\n", files.len()));
@@ -5311,7 +5311,7 @@ impl CodeIntelEngine {
             })
             .collect();
 
-        findings.sort_by(|a, b| b.severity.cmp(&a.severity));
+        findings.sort_by_key(|finding| std::cmp::Reverse(finding.severity));
 
         let mut output = format!("# CWE Top 25 Scan: {}\n\n", repo_name);
         output.push_str(&format!("**Files Scanned**: {}\n", files.len()));
@@ -5741,7 +5741,7 @@ impl CodeIntelEngine {
         output.push_str("|---------|-------|-------------|\n");
 
         let mut sorted_licenses: Vec<_> = report.dependencies_by_license.iter().collect();
-        sorted_licenses.sort_by(|a, b| b.1.len().cmp(&a.1.len()));
+        sorted_licenses.sort_by_key(|license| std::cmp::Reverse(license.1.len()));
 
         for (license, dep_list) in sorted_licenses.iter().take(15) {
             let deps_preview: String = dep_list
@@ -6086,7 +6086,7 @@ impl CodeIntelEngine {
                 })
                 .collect();
 
-            file_stats.sort_by(|a, b| (b.1 + b.2).cmp(&(a.1 + a.2)));
+            file_stats.sort_by_key(|stats| std::cmp::Reverse(stats.1 + stats.2));
             file_stats.truncate(20);
 
             for (file, deps, dependents) in file_stats {
@@ -6407,7 +6407,7 @@ impl CodeIntelEngine {
             }
 
             let mut counts: Vec<_> = by_kind.into_iter().collect();
-            counts.sort_by(|a, b| b.1.cmp(&a.1));
+            counts.sort_by_key(|count| std::cmp::Reverse(count.1));
 
             for (kind, count) in counts {
                 output.push_str(&format!("- {:?}: {}\n", kind, count));
@@ -6544,7 +6544,7 @@ impl CodeIntelEngine {
         } else {
             // Get all symbols - we can't determine visibility without AST info
             let mut public_symbols: Vec<_> = file_symbols.iter().collect();
-            public_symbols.sort_by(|a, b| a.start_line.cmp(&b.start_line));
+            public_symbols.sort_by_key(|symbol| symbol.start_line);
 
             output.push_str("## Exported Symbols\n\n");
             output.push_str("| Name | Kind | Line | Signature |\n");
