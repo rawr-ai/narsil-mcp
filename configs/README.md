@@ -100,7 +100,7 @@ To enable semantic code search with neural embeddings:
 }
 ```
 
-3. Add `--neural` and `--neural-backend api` to args
+3. Add `--neural`, `--neural-backend api`, and optionally `--neural-model voyage-code-3` to args
 
 ## Troubleshooting
 

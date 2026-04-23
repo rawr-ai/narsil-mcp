@@ -10,6 +10,7 @@ version = 1
 default_env_file = "~/.config/narsil-mcp/daemon.env"
 default_host = "127.0.0.1"
 default_path = "/mcp"
+default_neural_model = "voyage-code-3"
 
 # Optional. Empty means "auto-detect" (use `narsil-mcp` on PATH, or repo build output).
 default_bin = ""
@@ -43,4 +44,3 @@ label = "com.rawr.narsil-mcp-domain-b"
 port = 12007
 repos = ["/absolute/path/to/repo-b"]
 extra_args = ["--persist", "--git", "--call-graph", "--watch", "--lsp", "--neural"]
-

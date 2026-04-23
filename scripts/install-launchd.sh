@@ -13,6 +13,7 @@ HOST="${NARSIL_MCP_HOST:-127.0.0.1}"
 PORT="${NARSIL_MCP_PORT:-12006}"
 PATH_ARG="${NARSIL_MCP_PATH:-/mcp}"
 BIN_PATH="${NARSIL_MCP_BIN:-}"
+NEURAL_MODEL="${NARSIL_NEURAL_MODEL:-voyage-code-3}"
 LOAD_AFTER_INSTALL=1
 
 declare -a required_repos=()
@@ -34,6 +35,7 @@ Options:
   --host <host>           MCP HTTP host (default: ${HOST})
   --port <port>           MCP HTTP port (default: ${PORT})
   --path <path>           MCP HTTP path (default: ${PATH_ARG})
+  --neural-model <model>  Neural embedding model (default: ${NEURAL_MODEL})
   --codex-home <path>     CODEX_HOME for daemon env fallback (default: ${CODEX_HOME_PATH})
   --env-file <path>       daemon env file path (default: ${DAEMON_ENV_FILE})
   --extra-arg <arg>       extra argument passed to narsil-mcp (repeatable)
@@ -82,6 +84,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --path)
       PATH_ARG="$2"
+      shift 2
+      ;;
+    --neural-model)
+      NEURAL_MODEL="$2"
       shift 2
       ;;
     --codex-home)
@@ -210,7 +216,7 @@ REPO_GUARD
   printf '%q ' \
     "--index-path" "$INDEX_PATH" \
     "--persist" "--git" "--call-graph" "--watch" \
-    "--lsp" "--neural" "--neural-backend" "api" "--neural-model" "voyage-code-2" \
+    "--lsp" "--neural" "--neural-backend" "api" "--neural-model" "$NEURAL_MODEL" \
     "--mcp-http" "--mcp-http-host" "$HOST" "--mcp-http-port" "$PORT" "--mcp-http-path" "$PATH_ARG"
 
   if [[ ${extra_args+x} && ${#extra_args[@]} -gt 0 ]]; then
