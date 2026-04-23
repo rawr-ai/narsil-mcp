@@ -80,7 +80,7 @@ impl Default for NeuralConfig {
 /// ```
 /// use narsil_mcp::neural::default_dimension_for_model;
 /// assert_eq!(default_dimension_for_model(Some("text-embedding-3-large")), 3072);
-/// assert_eq!(default_dimension_for_model(Some("voyage-code-2")), 1024);
+/// assert_eq!(default_dimension_for_model(Some("voyage-code-2")), 1536);
 /// assert_eq!(default_dimension_for_model(None), 1536);
 /// ```
 #[must_use]
@@ -90,7 +90,7 @@ pub fn default_dimension_for_model(model: Option<&str>) -> usize {
         Some("text-embedding-3-small") => 1536,
         Some("text-embedding-ada-002") => 1536,
         Some(m) if m.starts_with("voyage-code-3") => 1024,
-        Some(m) if m.starts_with("voyage-code-2") => 1024,
+        Some(m) if m.starts_with("voyage-code-2") => 1536,
         Some(m) if m.starts_with("voyage-3") => 1024,
         Some(m) if m.starts_with("voyage-") => 1024,
         _ => 1536,
@@ -1134,8 +1134,8 @@ mod tests {
         let config = NeuralConfig::default();
         assert!(!config.enabled);
         assert_eq!(config.backend, "api");
-        // Default model is voyage-code-2 which has 1024 dimensions
-        assert_eq!(config.dimension, 1024);
+        // Default model is voyage-code-2 which has 1536 dimensions
+        assert_eq!(config.dimension, 1536);
     }
 
     #[test]
@@ -1155,7 +1155,7 @@ mod tests {
         );
 
         // Voyage models
-        assert_eq!(default_dimension_for_model(Some("voyage-code-2")), 1024);
+        assert_eq!(default_dimension_for_model(Some("voyage-code-2")), 1536);
         assert_eq!(default_dimension_for_model(Some("voyage-code-3")), 1024);
         assert_eq!(
             default_dimension_for_model(Some("voyage-code-3-lite")),
@@ -1211,7 +1211,7 @@ mod tests {
     fn test_api_embedder_creation() {
         // Test that embedders can be created with correct dimensions
         let voyage = ApiEmbedder::voyage("test-key");
-        assert_eq!(voyage.dimension, 1024);
+        assert_eq!(voyage.dimension, 1536);
 
         let openai = ApiEmbedder::openai("test-key");
         assert_eq!(openai.dimension, 1536);
@@ -1799,7 +1799,7 @@ mod tests {
         // Voyage model prefix variations
         assert_eq!(
             default_dimension_for_model(Some("voyage-code-2-lite")),
-            1024
+            1536
         );
         assert_eq!(default_dimension_for_model(Some("voyage-finance-2")), 1024);
         assert_eq!(default_dimension_for_model(Some("voyage-law-2")), 1024);
