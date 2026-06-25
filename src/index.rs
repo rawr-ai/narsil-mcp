@@ -562,12 +562,7 @@ impl CodeIntelEngine {
 
         // Rebuild file cache + lexical search index from disk contents.
         // Use ignore crate to respect .gitignore, consistent with indexing.
-        let walker = ignore::WalkBuilder::new(repo_root)
-            .hidden(true)
-            .git_ignore(true)
-            .git_global(true)
-            .git_exclude(true)
-            .build();
+        let walker = repo_walker(repo_root);
 
         let mut trees_for_callgraph: Vec<(String, String, tree_sitter::Tree)> = Vec::new();
 
@@ -612,6 +607,7 @@ impl CodeIntelEngine {
         }
 
         // Rebuild neural embeddings if enabled (best-effort; errors shouldn't crash startup).
+        // Do not block hydration of later repo routes on API-backed neural rebuilds.
         if let Some(ref neural) = self.neural_engine {
             let mut neural_docs: Vec<crate::neural::NeuralDocument> = Vec::new();
             if let Some(symbols) = self.symbols.get(&repo_id) {
@@ -630,16 +626,20 @@ impl CodeIntelEngine {
                 }
             }
             if !neural_docs.is_empty() {
-                let items: Vec<(crate::neural::NeuralDocument,)> =
-                    neural_docs.into_iter().map(|d| (d,)).collect();
-                if let Err(e) = neural.index_batch(&items) {
-                    warn!("Failed to rebuild neural embeddings for {}: {}", repo_id, e);
-                } else {
-                    info!(
-                        "Neural embeddings rebuilt from persisted symbols for {}",
-                        repo_id
-                    );
-                }
+                let neural = neural.clone();
+                let repo_id = repo_id.clone();
+                tokio::task::spawn_blocking(move || {
+                    let items: Vec<(crate::neural::NeuralDocument,)> =
+                        neural_docs.into_iter().map(|d| (d,)).collect();
+                    if let Err(e) = neural.index_batch(&items) {
+                        warn!("Failed to rebuild neural embeddings for {}: {}", repo_id, e);
+                    } else {
+                        info!(
+                            "Neural embeddings rebuilt from persisted symbols for {}",
+                            repo_id
+                        );
+                    }
+                });
             }
         }
 
@@ -662,12 +662,7 @@ impl CodeIntelEngine {
         let persisted = store.load_or_create(repo_root)?;
 
         // Collect current files (respect .gitignore, consistent with indexing).
-        let walker = ignore::WalkBuilder::new(repo_root)
-            .hidden(true)
-            .git_ignore(true)
-            .git_global(true)
-            .git_exclude(true)
-            .build();
+        let walker = repo_walker(repo_root);
 
         let mut current_files: std::collections::HashSet<PathBuf> =
             std::collections::HashSet::new();
@@ -820,17 +815,10 @@ impl CodeIntelEngine {
         let mut languages: HashMap<String, LanguageStats> = HashMap::new();
         let mut symbols_vec: Vec<Symbol> = Vec::new();
         let mut neural_docs: Vec<crate::neural::NeuralDocument> = Vec::new();
-        let mut file_count = 0;
         let mut total_lines = 0;
 
         // Use ignore crate to respect .gitignore
-        let walker = ignore::WalkBuilder::new(path)
-            .hidden(true)
-            .git_ignore(true)
-            .git_global(true)
-            .git_exclude(true)
-            .require_git(false)
-            .build();
+        let walker = repo_walker(path);
 
         let files: Vec<PathBuf> = walker
             .filter_map(|e| e.ok())
@@ -838,40 +826,56 @@ impl CodeIntelEngine {
             .map(|e| e.path().to_path_buf())
             .collect();
 
-        // Parse files in parallel
-        let metrics = Arc::clone(&self.metrics);
-        let parsed_results: Vec<_> = files
+        let readable_files: Vec<_> = files
             .par_iter()
             .filter_map(|file_path| {
-                let parse_start = std::time::Instant::now();
                 let content = std::fs::read_to_string(file_path).ok()?;
+                let relative_path = file_path
+                    .strip_prefix(path)
+                    .unwrap_or(file_path)
+                    .to_string_lossy()
+                    .to_string();
+                Some((file_path.clone(), relative_path, content))
+            })
+            .collect();
+
+        for (file_path, relative_path, content) in &readable_files {
+            self.file_cache
+                .insert(file_path.clone(), Arc::new(content.clone()));
+            self.search_index.index_file(relative_path, content);
+
+            let lines = content.lines().count();
+            total_lines += lines;
+
+            let language = get_language_id(relative_path);
+            let lang_stats = languages.entry(language.to_string()).or_default();
+            lang_stats.file_count += 1;
+            lang_stats.line_count += lines;
+            lang_stats.byte_count += content.len();
+        }
+        let file_count = readable_files.len();
+
+        // Parse searchable files in parallel where NARSIL has language support.
+        let metrics = Arc::clone(&self.metrics);
+        let parsed_results: Vec<_> = readable_files
+            .par_iter()
+            .filter_map(|(file_path, relative_path, content)| {
+                let parse_start = std::time::Instant::now();
                 let parsed = self.parser.parse_file(file_path, &content).ok()?;
                 metrics.record_file_parse(parse_start.elapsed());
-                Some((file_path.clone(), content, parsed))
+                Some((
+                    file_path.clone(),
+                    relative_path.clone(),
+                    content.clone(),
+                    parsed,
+                ))
             })
             .collect();
 
         // Collect parsed trees for call graph construction
         let mut trees_for_callgraph: Vec<(String, String, tree_sitter::Tree)> = Vec::new();
 
-        for (file_path, content, parsed) in parsed_results {
-            file_count += 1;
-            let lines = content.lines().count();
-            total_lines += lines;
-
-            // Update language stats
-            let lang_stats = languages.entry(parsed.language.clone()).or_default();
-            lang_stats.file_count += 1;
-            lang_stats.line_count += lines;
-            lang_stats.byte_count += content.len();
-
-            // Collect symbols with file path and index for embeddings
-            let relative_path = file_path
-                .strip_prefix(path)
-                .unwrap_or(&file_path)
-                .to_string_lossy()
-                .to_string();
-
+        for (_file_path, relative_path, content, parsed) in parsed_results {
             for mut symbol in parsed.symbols {
                 symbol.file_path = relative_path.clone();
 
@@ -901,13 +905,6 @@ impl CodeIntelEngine {
 
                 symbols_vec.push(symbol);
             }
-
-            // Cache file content
-            self.file_cache
-                .insert(file_path.clone(), Arc::new(content.clone()));
-
-            // Index file for semantic search
-            self.search_index.index_file(&relative_path, &content);
 
             // Collect tree for call graph if enabled and tree exists
             if self.options.call_graph_enabled {
@@ -1206,7 +1203,7 @@ impl CodeIntelEngine {
             let mut file_info: Vec<(PathBuf, SystemTime)> = self
                 .file_cache
                 .iter()
-                .filter(|entry| entry.key().starts_with(&repo_path))
+                .filter(|entry| file_belongs_to_repo(&self.repo_paths, &repo_path, entry.key()))
                 .filter_map(|entry| {
                     let path = entry.key().clone();
                     std::fs::metadata(&path)
@@ -1386,8 +1383,12 @@ impl CodeIntelEngine {
             QueryCacheKey::code_search_with_options(Some(&repo_id), query, &options)
         };
 
-        // Check cache first
-        if self.options.cache_enabled {
+        let cache_ready = self.initialization_complete.load(Ordering::Acquire);
+
+        // Check cache only after background hydration has completed. Before then,
+        // route-local file caches may still be filling and zero-result queries
+        // would otherwise poison later searches.
+        if self.options.cache_enabled && cache_ready {
             if let Some(cached) = self.query_cache.get(&cache_key) {
                 return Ok(cached);
             }
@@ -1470,7 +1471,7 @@ impl CodeIntelEngine {
         }
 
         // Cache the result with file dependencies for smart invalidation
-        if self.options.cache_enabled {
+        if self.options.cache_enabled && cache_ready {
             self.query_cache
                 .insert_with_files(cache_key, output.clone(), dependent_files);
         }
@@ -1599,7 +1600,7 @@ impl CodeIntelEngine {
                 let file_path = entry.key();
 
                 // Check if file is in this repo
-                if !file_path.starts_with(&repo_path) {
+                if !file_belongs_to_repo(&self.repo_paths, &repo_path, file_path) {
                     continue;
                 }
 
@@ -1800,7 +1801,7 @@ impl CodeIntelEngine {
 
         for entry in self.file_cache.iter() {
             let file_path = entry.key();
-            if !file_path.starts_with(repo_path) {
+            if !file_belongs_to_repo(&self.repo_paths, repo_path, file_path) {
                 continue;
             }
 
@@ -1941,7 +1942,7 @@ impl CodeIntelEngine {
 
             for entry in self.file_cache.iter() {
                 let fp = entry.key();
-                if !fp.starts_with(&repo_path) || fp == &file_path {
+                if !file_belongs_to_repo(&self.repo_paths, &repo_path, fp) || fp == &file_path {
                     continue;
                 }
 
@@ -2011,49 +2012,42 @@ impl CodeIntelEngine {
             // Create a persisted index from current state
             let mut persisted = PersistedIndex::new(repo_path.clone());
 
-            // Populate with current symbols
+            let mut by_file: HashMap<String, Vec<Symbol>> = HashMap::new();
             if let Some(symbols) = self.symbols.get(&repo_name) {
-                // Group symbols by file path
-                let mut by_file: HashMap<String, Vec<Symbol>> = HashMap::new();
                 for sym in symbols.iter() {
                     by_file
                         .entry(sym.file_path.clone())
                         .or_default()
                         .push(sym.clone());
                 }
+            }
 
-                // Create file metadata for each file
-                for (file_path, file_symbols) in by_file {
-                    let full_path = repo_path.join(&file_path);
-                    if let Ok(metadata) = std::fs::metadata(&full_path) {
-                        let modified = metadata
-                            .modified()
-                            .ok()
-                            .and_then(|m| m.duration_since(SystemTime::UNIX_EPOCH).ok())
-                            .map(|d| d.as_nanos())
-                            .and_then(|n| u64::try_from(n).ok())
-                            .unwrap_or(0);
+            for entry in self.file_cache.iter() {
+                let full_path = entry.key();
+                if owning_repo_root_for_path(&self.repo_paths, full_path) != Some(repo_path) {
+                    continue;
+                }
 
-                        let content_hash = if let Ok(content) = std::fs::read(&full_path) {
-                            use sha2::{Digest, Sha256};
-                            let mut hasher = Sha256::new();
-                            hasher.update(&content);
-                            format!("{:x}", hasher.finalize())
-                        } else {
-                            String::new()
-                        };
+                let rel_path = full_path
+                    .strip_prefix(repo_path)
+                    .unwrap_or(full_path)
+                    .to_string_lossy()
+                    .to_string();
+                let file_symbols = by_file.remove(&rel_path).unwrap_or_default();
 
-                        persisted.files.insert(
-                            full_path.clone(),
-                            crate::persist::FileMetadata {
-                                path: full_path,
-                                content_hash,
-                                modified_time: modified,
-                                size: metadata.len(),
-                                symbols: file_symbols,
-                            },
-                        );
-                    }
+                if let Some(file_metadata) =
+                    file_metadata_for_path(full_path, Some(entry.value().as_bytes()), file_symbols)
+                {
+                    persisted.files.insert(full_path.clone(), file_metadata);
+                }
+            }
+
+            // Preserve symbol-bearing files even if their content was not cached.
+            for (file_path, file_symbols) in by_file {
+                let full_path = repo_path.join(&file_path);
+                if let Some(file_metadata) = file_metadata_for_path(&full_path, None, file_symbols)
+                {
+                    persisted.files.insert(full_path, file_metadata);
                 }
             }
 
@@ -2164,8 +2158,8 @@ impl CodeIntelEngine {
                 resolved.unwrap_or_else(|| change.path.clone())
             };
 
-            // Find which repo this file belongs to
-            let repo_path = self.repo_paths.iter().find(|p| change_path.starts_with(p));
+            // Find the most specific configured repo root this file belongs to.
+            let repo_path = owning_repo_root_for_path(&self.repo_paths, &change_path);
 
             let repo_path = match repo_path {
                 Some(p) => p,
@@ -2194,13 +2188,17 @@ impl CodeIntelEngine {
 
                     // Re-index the changed file
                     if let Ok(content) = std::fs::read_to_string(&change_path) {
-                        if let Ok(parsed) = self.parser.parse_file(&change_path, &content) {
-                            let rel_path = change_path
-                                .strip_prefix(repo_path)
-                                .unwrap_or(&change_path)
-                                .to_string_lossy()
-                                .to_string();
+                        let rel_path = change_path
+                            .strip_prefix(repo_path)
+                            .unwrap_or(&change_path)
+                            .to_string_lossy()
+                            .to_string();
 
+                        self.file_cache
+                            .insert(change_path.clone(), Arc::new(content.clone()));
+                        self.search_index.index_file(&rel_path, &content);
+
+                        if let Ok(parsed) = self.parser.parse_file(&change_path, &content) {
                             // Update symbols for this file
                             if let Some(mut symbols) = self.symbols.get_mut(&repo_id) {
                                 // Remove old symbols from this file
@@ -2212,20 +2210,15 @@ impl CodeIntelEngine {
                                     symbols.push(symbol);
                                 }
                             }
-
-                            // Update file cache
-                            self.file_cache
-                                .insert(change_path.clone(), Arc::new(content.clone()));
-
-                            // Update search index
-                            self.search_index.index_file(&rel_path, &content);
-
-                            // Smart cache invalidation - only invalidate entries that depend on this file
-                            self.query_cache.invalidate_for_file(&rel_path);
-
-                            info!("Re-indexed file: {}", rel_path);
-                            count += 1;
+                        } else if let Some(mut symbols) = self.symbols.get_mut(&repo_id) {
+                            symbols.retain(|s| s.file_path != rel_path);
                         }
+
+                        // Smart cache invalidation - only invalidate entries that depend on this file
+                        self.query_cache.invalidate_for_file(&rel_path);
+
+                        info!("Re-indexed file: {}", rel_path);
+                        count += 1;
                     }
                 }
                 ChangeType::Deleted => {
@@ -4085,7 +4078,7 @@ impl CodeIntelEngine {
 
             for file_entry in self.file_cache.iter() {
                 let file_path = file_entry.key();
-                if !file_path.starts_with(repo_path) {
+                if !file_belongs_to_repo(&self.repo_paths, repo_path, file_path) {
                     continue;
                 }
                 // Skip test files if exclude_tests is enabled
@@ -4213,7 +4206,7 @@ impl CodeIntelEngine {
                     continue;
                 }
                 let file_path = file_entry.key();
-                if !file_path.starts_with(repo_path) {
+                if !file_belongs_to_repo(&self.repo_paths, repo_path, file_path) {
                     continue;
                 }
 
@@ -4405,7 +4398,7 @@ impl CodeIntelEngine {
 
         for file_entry in self.file_cache.iter() {
             let file_path = file_entry.key();
-            if !file_path.starts_with(&repo_path) {
+            if !file_belongs_to_repo(&self.repo_paths, &repo_path, file_path) {
                 continue;
             }
 
@@ -4530,7 +4523,7 @@ impl CodeIntelEngine {
         let files_to_analyze: Vec<std::path::PathBuf> = self
             .file_cache
             .iter()
-            .filter(|entry| entry.key().starts_with(&repo_path))
+            .filter(|entry| file_belongs_to_repo(&self.repo_paths, &repo_path, entry.key()))
             .filter(|entry| {
                 if let Some(specific_path) = path {
                     // Support both file and directory paths by checking if path matches
@@ -4770,7 +4763,7 @@ impl CodeIntelEngine {
         let files_to_analyze: Vec<std::path::PathBuf> = self
             .file_cache
             .iter()
-            .filter(|entry| entry.key().starts_with(&repo_path))
+            .filter(|entry| file_belongs_to_repo(&self.repo_paths, &repo_path, entry.key()))
             .filter(|entry| {
                 if let Some(specific_path) = path {
                     // Support both file and directory paths by checking if path matches
@@ -4922,7 +4915,7 @@ impl CodeIntelEngine {
         let files: Vec<(std::path::PathBuf, Arc<String>)> = self
             .file_cache
             .iter()
-            .filter(|entry| entry.key().starts_with(&repo_path))
+            .filter(|entry| file_belongs_to_repo(&self.repo_paths, &repo_path, entry.key()))
             .filter(|entry| !exclude_tests || !is_test_file(&entry.key().to_string_lossy()))
             .filter(|entry| !is_security_exemplar_file(&entry.key().to_string_lossy()))
             .filter(|entry| {
@@ -5125,7 +5118,7 @@ impl CodeIntelEngine {
         let files: Vec<_> = self
             .file_cache
             .iter()
-            .filter(|e| e.key().starts_with(&repo_path))
+            .filter(|e| file_belongs_to_repo(&self.repo_paths, &repo_path, e.key()))
             .filter(|e| path.is_none_or(|p| e.key().to_string_lossy().contains(p)))
             .filter(|e| !exclude_tests || !is_test_file(&e.key().to_string_lossy()))
             .filter(|e| !is_security_exemplar_file(&e.key().to_string_lossy()))
@@ -5243,7 +5236,7 @@ impl CodeIntelEngine {
         let files: Vec<_> = self
             .file_cache
             .iter()
-            .filter(|e| e.key().starts_with(&repo_path))
+            .filter(|e| file_belongs_to_repo(&self.repo_paths, &repo_path, e.key()))
             .filter(|e| path.is_none_or(|p| e.key().to_string_lossy().contains(p)))
             .filter(|e| !exclude_tests || !is_test_file(&e.key().to_string_lossy()))
             .filter(|e| !is_security_exemplar_file(&e.key().to_string_lossy()))
@@ -5295,7 +5288,7 @@ impl CodeIntelEngine {
         let files: Vec<_> = self
             .file_cache
             .iter()
-            .filter(|e| e.key().starts_with(&repo_path))
+            .filter(|e| file_belongs_to_repo(&self.repo_paths, &repo_path, e.key()))
             .filter(|e| path.is_none_or(|p| e.key().to_string_lossy().contains(p)))
             .filter(|e| !exclude_tests || !is_test_file(&e.key().to_string_lossy()))
             .filter(|e| !is_security_exemplar_file(&e.key().to_string_lossy()))
@@ -6369,7 +6362,11 @@ impl CodeIntelEngine {
         // Count files and symbols
         let symbol_count = self.symbols.get(&repo_id).map(|s| s.len()).unwrap_or(0);
 
-        let file_count = self.file_cache.len();
+        let file_count = self
+            .file_cache
+            .iter()
+            .filter(|entry| file_belongs_to_repo(&self.repo_paths, &repo_path, entry.key()))
+            .count();
 
         output.push_str("## Index Statistics\n\n");
         output.push_str(&format!("- **Repository**: {}\n", repo_path.display()));
@@ -6458,7 +6455,7 @@ impl CodeIntelEngine {
             let path = entry.key();
             let content = entry.value();
 
-            if !path.starts_with(&repo_path) {
+            if !file_belongs_to_repo(&self.repo_paths, &repo_path, path) {
                 continue;
             }
 
@@ -7244,7 +7241,7 @@ impl CodeIntelEngine {
             }
 
             let file_path = entry.key();
-            if !file_path.starts_with(&repo_path) {
+            if !file_belongs_to_repo(&self.repo_paths, &repo_path, file_path) {
                 continue;
             }
 
@@ -7930,7 +7927,7 @@ impl CodeIntelEngine {
         let files: Vec<FileInfo> = self
             .file_cache
             .iter()
-            .filter(|entry| entry.key().starts_with(&repo_path))
+            .filter(|entry| file_belongs_to_repo(&self.repo_paths, &repo_path, entry.key()))
             .map(|entry| {
                 let path = entry.key();
                 let path_str = path.to_string_lossy().to_string();
@@ -8387,6 +8384,101 @@ fn repo_id_from_path(path: &Path) -> String {
     format!("{}#{}", repo_display_name(path), short_hash)
 }
 
+fn repo_walker(repo_root: &Path) -> ignore::Walk {
+    let root = repo_root.to_path_buf();
+    let has_git_file = repo_root.join(".git").is_file();
+    let mut builder = ignore::WalkBuilder::new(repo_root);
+    builder
+        .hidden(false)
+        .parents(false)
+        .git_ignore(!has_git_file)
+        .git_global(true)
+        .git_exclude(!has_git_file)
+        .require_git(false)
+        .filter_entry(move |entry| should_visit_repo_entry(&root, entry.path()));
+    builder.build()
+}
+
+fn should_visit_repo_entry(repo_root: &Path, path: &Path) -> bool {
+    !is_hidden_relative_path(repo_root, path) && !is_nested_git_root(repo_root, path)
+}
+
+fn is_hidden_relative_path(repo_root: &Path, path: &Path) -> bool {
+    let Ok(relative_path) = path.strip_prefix(repo_root) else {
+        return false;
+    };
+
+    if relative_path.as_os_str().is_empty() {
+        return false;
+    }
+
+    relative_path.components().any(|component| {
+        matches!(
+            component,
+            std::path::Component::Normal(name)
+                if name.to_string_lossy().starts_with('.')
+        )
+    })
+}
+
+fn is_nested_git_root(repo_root: &Path, path: &Path) -> bool {
+    let Ok(relative_path) = path.strip_prefix(repo_root) else {
+        return false;
+    };
+
+    if relative_path.as_os_str().is_empty() {
+        return false;
+    }
+
+    path.join(".git").exists()
+}
+
+fn owning_repo_root_for_path<'a>(repo_paths: &'a [PathBuf], path: &Path) -> Option<&'a PathBuf> {
+    repo_paths
+        .iter()
+        .filter(|repo_path| path.starts_with(repo_path))
+        .max_by_key(|repo_path| repo_path.components().count())
+}
+
+fn file_belongs_to_repo(repo_paths: &[PathBuf], repo_path: &Path, path: &Path) -> bool {
+    owning_repo_root_for_path(repo_paths, path).is_some_and(|owner| owner == repo_path)
+}
+
+fn file_metadata_for_path(
+    full_path: &Path,
+    cached_content: Option<&[u8]>,
+    symbols: Vec<Symbol>,
+) -> Option<crate::persist::FileMetadata> {
+    let metadata = std::fs::metadata(full_path).ok()?;
+    let modified = metadata
+        .modified()
+        .ok()
+        .and_then(|m| m.duration_since(SystemTime::UNIX_EPOCH).ok())
+        .map(|d| d.as_nanos())
+        .and_then(|n| u64::try_from(n).ok())
+        .unwrap_or(0);
+
+    let content_hash = if let Some(content) = cached_content {
+        let mut hasher = Sha256::new();
+        hasher.update(content);
+        format!("{:x}", hasher.finalize())
+    } else if let Ok(content) = std::fs::read(full_path) {
+        let mut hasher = Sha256::new();
+        hasher.update(&content);
+        format!("{:x}", hasher.finalize())
+    } else {
+        String::new()
+    };
+
+    Some(crate::persist::FileMetadata {
+        path: full_path.to_path_buf(),
+        content_hash,
+        modified_time: modified,
+        size: metadata.len(),
+        symbols,
+    })
+}
+
 fn should_index_changed_file(repo_root: &Path, file_path: &Path) -> bool {
     let Ok(relative_path) = file_path.strip_prefix(repo_root) else {
         return false;
@@ -8678,6 +8770,57 @@ mod tests {
         let second = repo_id_from_path(&repo_path);
         assert_eq!(first, second);
         assert!(first.starts_with("project#"));
+    }
+
+    #[test]
+    fn nested_git_roots_are_skipped_but_configured_root_is_indexable() {
+        let temp = TempDir::new().expect("failed to create temp dir");
+        let repo_path = temp.path().join("project");
+        let nested_repo = repo_path.join("nested-repo");
+        let submodule_repo = repo_path.join("submodule-repo");
+        std::fs::create_dir_all(repo_path.join(".git")).expect("failed to create root git dir");
+        std::fs::create_dir_all(nested_repo.join(".git")).expect("failed to create nested git dir");
+        std::fs::create_dir_all(&submodule_repo).expect("failed to create submodule repo dir");
+        std::fs::write(
+            submodule_repo.join(".git"),
+            "gitdir: ../.git/modules/submodule-repo",
+        )
+        .expect("failed to create submodule git file");
+
+        assert!(!is_nested_git_root(&repo_path, &repo_path));
+        assert!(is_nested_git_root(&repo_path, &nested_repo));
+        assert!(is_nested_git_root(&repo_path, &submodule_repo));
+        assert!(!is_nested_git_root(&submodule_repo, &submodule_repo));
+    }
+
+    #[test]
+    fn hidden_ancestors_do_not_hide_configured_repo_root() {
+        let temp = TempDir::new().expect("failed to create temp dir");
+        let repo_path = temp.path().join(".hidden-parent").join("resources");
+        let hidden_child = repo_path.join(".cache");
+        let visible_child = repo_path.join("Base");
+
+        assert!(!is_hidden_relative_path(&repo_path, &repo_path));
+        assert!(!is_hidden_relative_path(&repo_path, &visible_child));
+        assert!(is_hidden_relative_path(&repo_path, &hidden_child));
+    }
+
+    #[test]
+    fn owning_repo_root_prefers_most_specific_nested_route() {
+        let temp = TempDir::new().expect("failed to create temp dir");
+        let repo_path = temp.path().join("project");
+        let resources_path = repo_path.join(".civ7").join("outputs").join("resources");
+        let file_path = resources_path.join("Base").join("example.js");
+        let repo_paths = vec![repo_path.clone(), resources_path.clone()];
+
+        assert_eq!(
+            owning_repo_root_for_path(&repo_paths, &file_path),
+            Some(&resources_path)
+        );
+        assert_eq!(
+            owning_repo_root_for_path(&repo_paths, &repo_path.join("src").join("main.ts")),
+            Some(&repo_path)
+        );
     }
 
     #[tokio::test]
