@@ -164,6 +164,11 @@ impl SearchIndex {
 
     /// Add a document to the index
     pub fn add_document(&mut self, doc: SearchDocument) {
+        self.insert_document(doc);
+        self.recalculate_avg_doc_len();
+    }
+
+    fn insert_document(&mut self, doc: SearchDocument) {
         let doc_idx = self.documents.len();
 
         // Update inverted index
@@ -181,19 +186,42 @@ impl SearchIndex {
         }
 
         self.documents.push(doc);
+    }
 
-        // Recalculate average document length
+    fn recalculate_avg_doc_len(&mut self) {
         let total_len: usize = self.documents.iter().map(|d| d.tokens.len()).sum();
-        self.avg_doc_len = total_len as f64 / self.documents.len() as f64;
+        self.avg_doc_len = if self.documents.is_empty() {
+            0.0
+        } else {
+            total_len as f64 / self.documents.len() as f64
+        };
+    }
+
+    fn rebuild_indexes(&mut self) {
+        let documents = std::mem::take(&mut self.documents);
+        self.inverted_index.clear();
+        self.doc_freq.clear();
+        self.avg_doc_len = 0.0;
+
+        for doc in documents {
+            self.insert_document(doc);
+        }
+
+        self.recalculate_avg_doc_len();
     }
 
     /// Index content from a file
     pub fn index_file(&mut self, file_path: &str, content: &str) {
+        self.index_file_with_id(file_path, file_path, content);
+    }
+
+    /// Index content from a file using a caller-provided stable document id.
+    pub fn index_file_with_id(&mut self, id: &str, file_path: &str, content: &str) {
         let tokens = tokenize_code(content);
         let term_freq = count_terms(&tokens);
 
         self.add_document(SearchDocument {
-            id: file_path.to_string(),
+            id: id.to_string(),
             file_path: file_path.to_string(),
             content: content.to_string(),
             doc_type: DocType::File,
@@ -202,6 +230,51 @@ impl SearchIndex {
             tokens,
             term_freq,
         });
+    }
+
+    /// Remove all documents associated with a file path.
+    pub fn remove_file(&mut self, file_path: &str) -> usize {
+        let before = self.documents.len();
+        self.documents
+            .retain(|doc| doc.file_path != file_path && doc.id != file_path);
+        let removed = before.saturating_sub(self.documents.len());
+
+        if removed > 0 {
+            self.rebuild_indexes();
+        }
+
+        removed
+    }
+
+    /// Remove documents associated with a caller-provided file document id.
+    pub fn remove_file_with_id(&mut self, id: &str) -> usize {
+        let before = self.documents.len();
+        let symbol_prefix = format!("{}::", id);
+        self.documents
+            .retain(|doc| doc.id != id && !doc.id.starts_with(&symbol_prefix));
+        let removed = before.saturating_sub(self.documents.len());
+
+        if removed > 0 {
+            self.rebuild_indexes();
+        }
+
+        removed
+    }
+
+    /// Replace the indexed file document for a path with current content.
+    pub fn replace_file(&mut self, file_path: &str, content: &str) {
+        self.replace_file_with_id(file_path, file_path, content);
+    }
+
+    /// Replace only the file document for a caller-provided document id.
+    pub fn replace_file_with_id(&mut self, id: &str, file_path: &str, content: &str) {
+        let before = self.documents.len();
+        self.documents
+            .retain(|doc| !(doc.id == id && doc.doc_type == DocType::File));
+        if before != self.documents.len() {
+            self.rebuild_indexes();
+        }
+        self.index_file_with_id(id, file_path, content);
     }
 
     /// Index a symbol (function, class, etc.)
@@ -520,6 +593,30 @@ impl ConcurrentSearchIndex {
         self.inner.write().index_file(file_path, content);
     }
 
+    pub fn index_file_with_id(&self, id: &str, file_path: &str, content: &str) {
+        self.inner
+            .write()
+            .index_file_with_id(id, file_path, content);
+    }
+
+    pub fn remove_file(&self, file_path: &str) -> usize {
+        self.inner.write().remove_file(file_path)
+    }
+
+    pub fn remove_file_with_id(&self, id: &str) -> usize {
+        self.inner.write().remove_file_with_id(id)
+    }
+
+    pub fn replace_file(&self, file_path: &str, content: &str) {
+        self.inner.write().replace_file(file_path, content);
+    }
+
+    pub fn replace_file_with_id(&self, id: &str, file_path: &str, content: &str) {
+        self.inner
+            .write()
+            .replace_file_with_id(id, file_path, content);
+    }
+
     pub fn search(&self, query: &str, max_results: usize) -> Vec<SearchResult> {
         self.inner.read().search(query, max_results)
     }
@@ -579,6 +676,107 @@ mod tests {
         let results = index.search("user", 10);
         assert!(!results.is_empty());
         assert!(results[0].score > 0.0);
+    }
+
+    #[test]
+    fn replace_file_removes_old_terms_and_keeps_one_file_doc() {
+        let mut index = SearchIndex::new();
+
+        index.index_file("src/lib.rs", "fn alpha_unique() {}");
+        index.replace_file("src/lib.rs", "fn beta_unique() {}");
+
+        assert!(index.search("alpha", 10).is_empty());
+        assert_eq!(index.search("beta", 10).len(), 1);
+        assert_eq!(index.stats().total_documents, 1);
+    }
+
+    #[test]
+    fn replace_file_preserves_same_path_symbol_docs() {
+        let mut index = SearchIndex::new();
+
+        index.index_file("src/lib.rs", "fn oldfiletermunique() {}");
+        index.index_symbol(
+            "src/lib.rs",
+            "kept_symbol",
+            "fn symboluniqueterm() {}",
+            DocType::Function,
+            1,
+            1,
+        );
+        index.replace_file("src/lib.rs", "fn newfiletermunique() {}");
+
+        assert!(index.search("oldfiletermunique", 10).is_empty());
+        assert_eq!(index.search("newfiletermunique", 10).len(), 1);
+        assert_eq!(index.search("symboluniqueterm", 10).len(), 1);
+        assert_eq!(index.stats().total_documents, 2);
+    }
+
+    #[test]
+    fn replace_file_with_id_does_not_touch_same_display_path_other_repo() {
+        let mut index = SearchIndex::new();
+
+        index.index_file_with_id("repo-a:src/lib.rs", "src/lib.rs", "fn alpharepoterm() {}");
+        index.index_file_with_id("repo-b:src/lib.rs", "src/lib.rs", "fn betarepoterm() {}");
+        index.replace_file_with_id("repo-a:src/lib.rs", "src/lib.rs", "fn alphafreshterm() {}");
+
+        assert!(index.search("alpharepoterm", 10).is_empty());
+        assert_eq!(index.search("alphafreshterm", 10).len(), 1);
+        assert_eq!(index.search("betarepoterm", 10).len(), 1);
+        assert_eq!(index.stats().total_documents, 2);
+    }
+
+    #[test]
+    fn remove_file_deletes_content_from_search() {
+        let mut index = SearchIndex::new();
+
+        index.index_file("src/lib.rs", "fn deleted_unique() {}");
+        assert_eq!(index.remove_file("src/lib.rs"), 1);
+
+        assert!(index.search("deleted_unique", 10).is_empty());
+        assert_eq!(index.stats().total_documents, 0);
+        assert_eq!(index.stats().avg_doc_length, 0.0);
+    }
+
+    #[test]
+    fn remove_file_preserves_unrelated_symbol_docs() {
+        let mut index = SearchIndex::new();
+
+        index.index_file("src/a.rs", "fn file_only_term() {}");
+        index.add_document(SearchDocument {
+            id: "src/a.rs.backup::thing".to_string(),
+            file_path: "src/a.rs.backup".to_string(),
+            content: "fn symbol_unique() {}".to_string(),
+            doc_type: DocType::Function,
+            start_line: 1,
+            end_line: 1,
+            tokens: tokenize_code("fn symbol_unique() {}"),
+            term_freq: count_terms(&tokenize_code("fn symbol_unique() {}")),
+        });
+
+        assert_eq!(index.remove_file("src/a.rs"), 1);
+        assert!(index.search("file_only_term", 10).is_empty());
+        assert_eq!(index.search("symbol_unique", 10).len(), 1);
+        assert_eq!(index.stats().total_documents, 1);
+    }
+
+    #[test]
+    fn remove_file_rebuilds_term_statistics_for_remaining_docs() {
+        let mut index = SearchIndex::new();
+
+        index.index_file("a.rs", "alpha shared");
+        index.index_file("b.rs", "beta shared");
+        assert_eq!(index.stats().total_documents, 2);
+        assert!(index.stats().total_terms >= 3);
+
+        assert_eq!(index.remove_file("a.rs"), 1);
+        let stats = index.stats();
+        assert_eq!(stats.total_documents, 1);
+        assert!(stats.avg_doc_length > 0.0);
+        assert_eq!(index.doc_freq.get("shared"), Some(&1));
+        assert_eq!(index.doc_freq.get("alpha"), None);
+        assert_eq!(index.doc_freq.get("beta"), Some(&1));
+        assert!(index.search("alpha", 10).is_empty());
+        assert_eq!(index.search("beta", 10).len(), 1);
     }
 
     #[test]

@@ -475,6 +475,180 @@ async fn test_process_file_changes_skips_gitignored_source_files() -> Result<()>
 }
 
 #[tokio::test]
+async fn test_process_file_changes_replaces_search_document_on_modify() -> Result<()> {
+    use narsil_mcp::index::{CodeIntelEngine, EngineOptions};
+    use narsil_mcp::persist::{ChangeType, FileChange};
+
+    let repo = TestRepo::new()?;
+    repo.add_rust_file("src/lib.rs", "pub fn stalelexicalterm() {}")?;
+
+    let index_dir = TempDir::new()?;
+    let options = EngineOptions {
+        git_enabled: false,
+        call_graph_enabled: false,
+        persist_enabled: false,
+        watch_enabled: true,
+        cache_enabled: false,
+        streaming_config: StreamingConfig::default(),
+        lsp_config: LspConfig::default(),
+        neural_config: NeuralConfig::default(),
+        ..Default::default()
+    };
+
+    let engine = CodeIntelEngine::with_options(
+        index_dir.path().to_path_buf(),
+        vec![repo.path().to_path_buf()],
+        options,
+    )
+    .await?;
+    engine.complete_initialization().await?;
+
+    let repo_name = repo.path().file_name().unwrap().to_string_lossy();
+    let before = engine
+        .semantic_search(Some(&repo_name), "stalelexicalterm", 10, None, None)
+        .await?;
+    assert!(before.contains("Found 1 results"));
+
+    repo.add_rust_file("src/lib.rs", "pub fn freshlexicalterm() {}")?;
+    let changed_path = repo.path().join("src/lib.rs");
+    let changed = engine
+        .process_file_changes(&[FileChange {
+            path: changed_path,
+            change_type: ChangeType::Modified,
+        }])
+        .await?;
+    assert_eq!(changed, 1);
+
+    let stale = engine
+        .semantic_search(Some(&repo_name), "stalelexicalterm", 10, None, None)
+        .await?;
+    assert!(stale.contains("Found 0 results"));
+
+    let fresh = engine
+        .semantic_search(Some(&repo_name), "freshlexicalterm", 10, None, None)
+        .await?;
+    assert!(fresh.contains("Found 1 results"));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_process_file_changes_removes_search_document_on_delete() -> Result<()> {
+    use narsil_mcp::index::{CodeIntelEngine, EngineOptions};
+    use narsil_mcp::persist::{ChangeType, FileChange};
+
+    let repo = TestRepo::new()?;
+    repo.add_rust_file("src/lib.rs", "pub fn deletedlexicalterm() {}")?;
+
+    let index_dir = TempDir::new()?;
+    let options = EngineOptions {
+        git_enabled: false,
+        call_graph_enabled: false,
+        persist_enabled: false,
+        watch_enabled: true,
+        cache_enabled: false,
+        streaming_config: StreamingConfig::default(),
+        lsp_config: LspConfig::default(),
+        neural_config: NeuralConfig::default(),
+        ..Default::default()
+    };
+
+    let engine = CodeIntelEngine::with_options(
+        index_dir.path().to_path_buf(),
+        vec![repo.path().to_path_buf()],
+        options,
+    )
+    .await?;
+    engine.complete_initialization().await?;
+
+    let repo_name = repo.path().file_name().unwrap().to_string_lossy();
+    let before = engine
+        .semantic_search(Some(&repo_name), "deletedlexicalterm", 10, None, None)
+        .await?;
+    assert!(before.contains("Found 1 results"));
+
+    let deleted_path = repo.path().join("src/lib.rs");
+    std::fs::remove_file(&deleted_path)?;
+    let changed = engine
+        .process_file_changes(&[FileChange {
+            path: deleted_path,
+            change_type: ChangeType::Deleted,
+        }])
+        .await?;
+    assert_eq!(changed, 1);
+
+    let after = engine
+        .semantic_search(Some(&repo_name), "deletedlexicalterm", 10, None, None)
+        .await?;
+    assert!(after.contains("Found 0 results"));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_process_file_changes_keeps_same_relative_path_in_other_repo() -> Result<()> {
+    use narsil_mcp::index::{CodeIntelEngine, EngineOptions};
+    use narsil_mcp::persist::{ChangeType, FileChange};
+
+    let repo_a = TestRepo::new()?;
+    let repo_b = TestRepo::new()?;
+    repo_a.add_rust_file("src/lib.rs", "pub fn repoaoriginalterm() {}")?;
+    repo_b.add_rust_file("src/lib.rs", "pub fn repobsurvivorterm() {}")?;
+
+    let index_dir = TempDir::new()?;
+    let options = EngineOptions {
+        git_enabled: false,
+        call_graph_enabled: false,
+        persist_enabled: false,
+        watch_enabled: true,
+        cache_enabled: false,
+        streaming_config: StreamingConfig::default(),
+        lsp_config: LspConfig::default(),
+        neural_config: NeuralConfig::default(),
+        ..Default::default()
+    };
+
+    let engine = CodeIntelEngine::with_options(
+        index_dir.path().to_path_buf(),
+        vec![repo_a.path().to_path_buf(), repo_b.path().to_path_buf()],
+        options,
+    )
+    .await?;
+    engine.complete_initialization().await?;
+
+    let before = engine
+        .semantic_search(None, "repobsurvivorterm", 10, None, None)
+        .await?;
+    assert!(before.contains("Found 1 results"));
+
+    repo_a.add_rust_file("src/lib.rs", "pub fn repoareplacedterm() {}")?;
+    let changed = engine
+        .process_file_changes(&[FileChange {
+            path: repo_a.path().join("src/lib.rs"),
+            change_type: ChangeType::Modified,
+        }])
+        .await?;
+    assert_eq!(changed, 1);
+
+    let stale_a = engine
+        .semantic_search(None, "repoaoriginalterm", 10, None, None)
+        .await?;
+    assert!(stale_a.contains("Found 0 results"));
+
+    let fresh_a = engine
+        .semantic_search(None, "repoareplacedterm", 10, None, None)
+        .await?;
+    assert!(fresh_a.contains("Found 1 results"));
+
+    let still_b = engine
+        .semantic_search(None, "repobsurvivorterm", 10, None, None)
+        .await?;
+    assert!(still_b.contains("Found 1 results"));
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn test_async_watcher_disabled_when_watch_disabled() -> Result<()> {
     use narsil_mcp::index::{CodeIntelEngine, EngineOptions};
 

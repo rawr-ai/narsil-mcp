@@ -583,7 +583,11 @@ impl CodeIntelEngine {
 
             self.file_cache
                 .insert(file_path.to_path_buf(), Arc::new(content.clone()));
-            self.search_index.index_file(&rel_path, &content);
+            self.search_index.index_file_with_id(
+                &search_document_id(&repo_id, &rel_path),
+                &rel_path,
+                &content,
+            );
 
             if self.options.call_graph_enabled {
                 if let Ok(parsed) = self.parser.parse_file(file_path, &content) {
@@ -712,6 +716,8 @@ impl CodeIntelEngine {
                         .to_string_lossy()
                         .to_string();
                     symbols.retain(|s| s.file_path != rel_path);
+                    self.search_index
+                        .remove_file_with_id(&search_document_id(&repo_id, &rel_path));
                     self.query_cache.invalidate_for_file(&rel_path);
                     changed += 1;
                 }
@@ -747,7 +753,11 @@ impl CodeIntelEngine {
 
                 self.file_cache
                     .insert(abs_path.clone(), Arc::new(content.clone()));
-                self.search_index.index_file(&rel_path, &content);
+                self.search_index.replace_file_with_id(
+                    &search_document_id(&repo_id, &rel_path),
+                    &rel_path,
+                    &content,
+                );
                 self.query_cache.invalidate_for_file(&rel_path);
 
                 changed += 1;
@@ -842,7 +852,11 @@ impl CodeIntelEngine {
         for (file_path, relative_path, content) in &readable_files {
             self.file_cache
                 .insert(file_path.clone(), Arc::new(content.clone()));
-            self.search_index.index_file(relative_path, content);
+            self.search_index.index_file_with_id(
+                &search_document_id(&repo_id, relative_path),
+                relative_path,
+                content,
+            );
 
             let lines = content.lines().count();
             total_lines += lines;
@@ -1041,6 +1055,7 @@ impl CodeIntelEngine {
             Some(name) => {
                 let repo_id = self.resolve_repo_id(name)?;
                 let path = self.get_repo_path(name)?;
+                self.remove_search_docs_for_repo_path(&path);
                 self.repos.remove(&repo_id);
                 self.symbols.remove(&repo_id);
                 self.call_graphs.remove(&repo_id);
@@ -1060,6 +1075,37 @@ impl CodeIntelEngine {
                 Ok("Re-indexed all repositories".to_string())
             }
         }
+    }
+
+    fn remove_search_docs_for_repo_path(&self, repo_path: &Path) -> usize {
+        let rel_paths: Vec<String> = self
+            .file_cache
+            .iter()
+            .filter_map(|entry| {
+                let file_path = entry.key();
+                if !file_belongs_to_repo(&self.repo_paths, repo_path, file_path) {
+                    return None;
+                }
+
+                Some(
+                    file_path
+                        .strip_prefix(repo_path)
+                        .unwrap_or(file_path)
+                        .to_string_lossy()
+                        .to_string(),
+                )
+            })
+            .collect();
+
+        rel_paths
+            .iter()
+            .map(|rel_path| {
+                self.search_index.remove_file_with_id(&search_document_id(
+                    &repo_id_from_path(repo_path),
+                    rel_path,
+                ))
+            })
+            .sum()
     }
 
     fn resolve_repo_id(&self, input: &str) -> Result<String> {
@@ -2143,7 +2189,7 @@ impl CodeIntelEngine {
                 if change.path.exists() {
                     std::fs::canonicalize(&change.path).unwrap_or_else(|_| change.path.clone())
                 } else {
-                    change.path.clone()
+                    canonicalize_missing_path(&change.path).unwrap_or_else(|| change.path.clone())
                 }
             } else {
                 let mut resolved: Option<PathBuf> = None;
@@ -2181,6 +2227,8 @@ impl CodeIntelEngine {
                             symbols.retain(|s| s.file_path != rel_path);
                         }
                         self.file_cache.remove(&change_path);
+                        self.search_index
+                            .remove_file_with_id(&search_document_id(&repo_id, &rel_path));
                         self.query_cache.invalidate_for_file(&rel_path);
                         count += 1;
                         continue;
@@ -2196,7 +2244,11 @@ impl CodeIntelEngine {
 
                         self.file_cache
                             .insert(change_path.clone(), Arc::new(content.clone()));
-                        self.search_index.index_file(&rel_path, &content);
+                        self.search_index.replace_file_with_id(
+                            &search_document_id(&repo_id, &rel_path),
+                            &rel_path,
+                            &content,
+                        );
 
                         if let Ok(parsed) = self.parser.parse_file(&change_path, &content) {
                             // Update symbols for this file
@@ -2235,6 +2287,8 @@ impl CodeIntelEngine {
 
                     // Remove from file cache
                     self.file_cache.remove(&change_path);
+                    self.search_index
+                        .remove_file_with_id(&search_document_id(&repo_id, &rel_path));
 
                     // Smart cache invalidation - only invalidate entries that depend on this file
                     self.query_cache.invalidate_for_file(&rel_path);
@@ -8384,6 +8438,10 @@ fn repo_id_from_path(path: &Path) -> String {
     format!("{}#{}", repo_display_name(path), short_hash)
 }
 
+fn search_document_id(repo_id: &str, relative_path: &str) -> String {
+    format!("{}:{}", repo_id, relative_path)
+}
+
 fn repo_walker(repo_root: &Path) -> ignore::Walk {
     let root = repo_root.to_path_buf();
     let has_git_file = repo_root.join(".git").is_file();
@@ -8438,6 +8496,24 @@ fn owning_repo_root_for_path<'a>(repo_paths: &'a [PathBuf], path: &Path) -> Opti
         .iter()
         .filter(|repo_path| path.starts_with(repo_path))
         .max_by_key(|repo_path| repo_path.components().count())
+}
+
+fn canonicalize_missing_path(path: &Path) -> Option<PathBuf> {
+    let mut missing_components: Vec<std::ffi::OsString> = Vec::new();
+    let mut ancestor = path;
+
+    while !ancestor.exists() {
+        let file_name = ancestor.file_name()?.to_os_string();
+        missing_components.push(file_name);
+        ancestor = ancestor.parent()?;
+    }
+
+    let mut canonical = std::fs::canonicalize(ancestor).ok()?;
+    for component in missing_components.iter().rev() {
+        canonical.push(component);
+    }
+
+    Some(canonical)
 }
 
 fn file_belongs_to_repo(repo_paths: &[PathBuf], repo_path: &Path, path: &Path) -> bool {

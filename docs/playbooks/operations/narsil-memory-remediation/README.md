@@ -56,7 +56,7 @@ requires a controlled fixture or runtime-local measurement.
 | --- | --- | --- |
 | `codex/narsil-memory-proof-rails` | Add this sanitized workstream record. | static |
 | `codex/narsil-mcp-session-pruning` | [Bound MCP HTTP session retention.](02-mcp-session-pruning.md) | unit, integration |
-| `codex/narsil-search-index-replace` | Replace/remove search docs by file path. | unit, integration |
+| `codex/narsil-search-index-replace` | [Replace/remove search docs by file path.](03-search-index-replace.md) | unit, integration |
 | `codex/narsil-memory-regression-coverage` | Add recurrence tests and fixture coverage. | unit, integration |
 | `codex/narsil-legacy-launcher-cleanup` | Make stale launcher/client artifacts detectable and reversible to clean up. | static, operational |
 | `codex/narsil-large-root-profiles` | Conditional opt-in memory profile after proof. | runtime-local |
