@@ -166,6 +166,14 @@ struct ServerArgs {
     #[arg(long, default_value = "/mcp")]
     mcp_http_path: String,
 
+    /// MCP HTTP session idle TTL in seconds (default: 1800 = 30 minutes)
+    #[arg(long, default_value = "1800")]
+    mcp_session_idle_ttl_seconds: u64,
+
+    /// Maximum active MCP HTTP sessions (default: 512)
+    #[arg(long, default_value = "512")]
+    mcp_session_max: usize,
+
     /// Tool preset (minimal, balanced, full, security-focused)
     /// Overrides the preset from config file
     #[arg(long)]
@@ -417,6 +425,10 @@ async fn main() -> Result<()> {
                 server_args.mcp_http_port,
                 server_args.mcp_http_path,
                 server_args.preset.clone(),
+                mcp_http::McpHttpSessionConfig::new(
+                    server_args.mcp_session_idle_ttl_seconds,
+                    server_args.mcp_session_max,
+                ),
             );
             tokio::try_join!(vis_server.run(), mcp_http_server.run())?;
         } else {
@@ -430,6 +442,10 @@ async fn main() -> Result<()> {
                 server_args.mcp_http_port,
                 server_args.mcp_http_path,
                 server_args.preset.clone(),
+                mcp_http::McpHttpSessionConfig::new(
+                    server_args.mcp_session_idle_ttl_seconds,
+                    server_args.mcp_session_max,
+                ),
             );
             mcp_http_server.run().await?;
         }
