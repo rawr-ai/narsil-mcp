@@ -408,7 +408,7 @@ async fn test_async_watcher_creation() -> Result<()> {
 #[tokio::test]
 async fn test_process_file_changes_skips_gitignored_source_files() -> Result<()> {
     use narsil_mcp::index::{CodeIntelEngine, EngineOptions};
-    use narsil_mcp::persist::{ChangeType, FileChange};
+    use narsil_mcp::persist::{ChangeType, FileChange, IndexStore};
 
     let repo = TestRepo::new()?;
     repo.add_rust_file("src/lib.rs", "pub fn allowed_symbol() {}")?;
@@ -421,10 +421,11 @@ async fn test_process_file_changes_skips_gitignored_source_files() -> Result<()>
     std::fs::write(&ignored_path, "pub fn ignored_symbol() {}")?;
 
     let index_dir = TempDir::new()?;
+    let repo_root = std::fs::canonicalize(repo.path())?;
     let options = EngineOptions {
         git_enabled: false,
         call_graph_enabled: false,
-        persist_enabled: false,
+        persist_enabled: true,
         watch_enabled: true,
         streaming_config: StreamingConfig::default(),
         lsp_config: LspConfig::default(),
@@ -434,19 +435,34 @@ async fn test_process_file_changes_skips_gitignored_source_files() -> Result<()>
 
     let engine = CodeIntelEngine::with_options(
         index_dir.path().to_path_buf(),
-        vec![repo.path().to_path_buf()],
+        vec![repo_root.clone()],
         options,
     )
     .await?;
     engine.complete_initialization().await?;
 
+    let store = IndexStore::new(index_dir.path().to_path_buf())?;
+    let index_path = store.index_path(&repo_root);
+    let index_before = std::fs::read(&index_path)?;
+
     let changed = engine
         .process_file_changes(&[FileChange {
-            path: ignored_path,
+            path: ignored_path.clone(),
             change_type: ChangeType::Created,
         }])
         .await?;
-    assert_eq!(changed, 1);
+    assert_eq!(changed, 0);
+    assert_eq!(std::fs::read(&index_path)?, index_before);
+
+    std::fs::remove_file(&ignored_path)?;
+    let deleted = engine
+        .process_file_changes(&[FileChange {
+            path: ignored_path,
+            change_type: ChangeType::Deleted,
+        }])
+        .await?;
+    assert_eq!(deleted, 0);
+    assert_eq!(std::fs::read(&index_path)?, index_before);
 
     let repo_name = repo.path().file_name().unwrap().to_string_lossy();
     let ignored = engine
@@ -470,6 +486,70 @@ async fn test_process_file_changes_skips_gitignored_source_files() -> Result<()>
         )
         .await?;
     assert!(allowed.contains("allowed_symbol"));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_process_file_changes_removes_file_that_becomes_ignored() -> Result<()> {
+    use narsil_mcp::index::{CodeIntelEngine, EngineOptions};
+    use narsil_mcp::persist::{ChangeType, FileChange};
+
+    let repo = TestRepo::new()?;
+    repo.add_rust_file("generated/index.rs", "pub fn formerly_indexed_symbol() {}")?;
+
+    let index_dir = TempDir::new()?;
+    let options = EngineOptions {
+        git_enabled: false,
+        call_graph_enabled: false,
+        persist_enabled: false,
+        watch_enabled: true,
+        cache_enabled: false,
+        streaming_config: StreamingConfig::default(),
+        lsp_config: LspConfig::default(),
+        neural_config: NeuralConfig::default(),
+        ..Default::default()
+    };
+
+    let engine = CodeIntelEngine::with_options(
+        index_dir.path().to_path_buf(),
+        vec![repo.path().to_path_buf()],
+        options,
+    )
+    .await?;
+    engine.complete_initialization().await?;
+
+    let repo_name = repo.path().file_name().unwrap().to_string_lossy();
+    let before = engine
+        .find_symbols(
+            &repo_name,
+            Some("function"),
+            Some("formerly_indexed_symbol"),
+            None,
+            None,
+        )
+        .await?;
+    assert!(before.contains("formerly_indexed_symbol"));
+
+    std::fs::write(repo.path().join(".gitignore"), "generated/\n")?;
+    let changed = engine
+        .process_file_changes(&[FileChange {
+            path: repo.path().join("generated/index.rs"),
+            change_type: ChangeType::Modified,
+        }])
+        .await?;
+    assert_eq!(changed, 1);
+
+    let after = engine
+        .find_symbols(
+            &repo_name,
+            Some("function"),
+            Some("formerly_indexed_symbol"),
+            None,
+            None,
+        )
+        .await?;
+    assert!(after.contains("Found 0 symbols"));
 
     Ok(())
 }

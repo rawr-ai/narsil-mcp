@@ -2247,15 +2247,10 @@ impl CodeIntelEngine {
                             .to_string_lossy()
                             .to_string();
 
-                        if let Some(mut symbols) = self.symbols.get_mut(&repo_id) {
-                            symbols.retain(|s| s.file_path != rel_path);
+                        if self.remove_indexed_file_state(&repo_id, &rel_path, &change_path) {
+                            count += 1;
+                            changed_repos.insert(repo_path.clone());
                         }
-                        self.file_cache.remove(&change_path);
-                        self.search_index
-                            .remove_file_with_id(&search_document_id(&repo_id, &rel_path));
-                        self.query_cache.invalidate_for_file(&rel_path);
-                        count += 1;
-                        changed_repos.insert(repo_path.clone());
                         continue;
                     }
 
@@ -2306,22 +2301,11 @@ impl CodeIntelEngine {
                         .to_string_lossy()
                         .to_string();
 
-                    // Remove symbols for this file
-                    if let Some(mut symbols) = self.symbols.get_mut(&repo_id) {
-                        symbols.retain(|s| s.file_path != rel_path);
+                    if self.remove_indexed_file_state(&repo_id, &rel_path, &change_path) {
+                        info!("Removed file from index: {}", rel_path);
+                        count += 1;
+                        changed_repos.insert(repo_path.clone());
                     }
-
-                    // Remove from file cache
-                    self.file_cache.remove(&change_path);
-                    self.search_index
-                        .remove_file_with_id(&search_document_id(&repo_id, &rel_path));
-
-                    // Smart cache invalidation - only invalidate entries that depend on this file
-                    self.query_cache.invalidate_for_file(&rel_path);
-
-                    info!("Removed file from index: {}", rel_path);
-                    count += 1;
-                    changed_repos.insert(repo_path.clone());
                 }
             }
         }
@@ -2332,6 +2316,28 @@ impl CodeIntelEngine {
         }
 
         Ok(count)
+    }
+
+    fn remove_indexed_file_state(&self, repo_id: &str, rel_path: &str, change_path: &Path) -> bool {
+        let mut removed = false;
+
+        if let Some(mut symbols) = self.symbols.get_mut(repo_id) {
+            let before = symbols.len();
+            symbols.retain(|symbol| symbol.file_path != rel_path);
+            removed |= symbols.len() != before;
+        }
+
+        removed |= self.file_cache.remove(change_path).is_some();
+        removed |= self
+            .search_index
+            .remove_file_with_id(&search_document_id(repo_id, rel_path))
+            > 0;
+
+        if removed {
+            self.query_cache.invalidate_for_file(rel_path);
+        }
+
+        removed
     }
 
     // === Git Integration Methods ===
