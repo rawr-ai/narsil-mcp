@@ -10,7 +10,7 @@ use dashmap::DashMap;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -2053,64 +2053,87 @@ impl CodeIntelEngine {
 
         let mut saved_count = 0;
         for repo_path in &self.repo_paths {
-            let repo_name = repo_id_from_path(repo_path);
-
-            // Create a persisted index from current state
-            let mut persisted = PersistedIndex::new(repo_path.clone());
-
-            let mut by_file: HashMap<String, Vec<Symbol>> = HashMap::new();
-            if let Some(symbols) = self.symbols.get(&repo_name) {
-                for sym in symbols.iter() {
-                    by_file
-                        .entry(sym.file_path.clone())
-                        .or_default()
-                        .push(sym.clone());
-                }
-            }
-
-            for entry in self.file_cache.iter() {
-                let full_path = entry.key();
-                if owning_repo_root_for_path(&self.repo_paths, full_path) != Some(repo_path) {
-                    continue;
-                }
-
-                let rel_path = full_path
-                    .strip_prefix(repo_path)
-                    .unwrap_or(full_path)
-                    .to_string_lossy()
-                    .to_string();
-                let file_symbols = by_file.remove(&rel_path).unwrap_or_default();
-
-                if let Some(file_metadata) =
-                    file_metadata_for_path(full_path, Some(entry.value().as_bytes()), file_symbols)
-                {
-                    persisted.files.insert(full_path.clone(), file_metadata);
-                }
-            }
-
-            // Preserve symbol-bearing files even if their content was not cached.
-            for (file_path, file_symbols) in by_file {
-                let full_path = repo_path.join(&file_path);
-                if let Some(file_metadata) = file_metadata_for_path(&full_path, None, file_symbols)
-                {
-                    persisted.files.insert(full_path, file_metadata);
-                }
-            }
-
-            // Save the index
-            store.save(&persisted)?;
+            self.save_repo_index(store, repo_path)?;
             saved_count += 1;
-            info!(
-                "Saved index for {} ({} files)",
-                repo_name,
-                persisted.files.len()
-            );
         }
 
         Ok(format!(
             "Saved {} repository index(es) to disk successfully.",
             saved_count
         ))
+    }
+
+    fn save_indexes_for_repos(&self, repo_paths: &HashSet<PathBuf>) -> Result<usize> {
+        let store = self
+            .index_store
+            .as_ref()
+            .context("Persistence store is not initialized")?;
+        let mut saved_count = 0;
+
+        for repo_path in &self.repo_paths {
+            if !repo_paths.contains(repo_path) {
+                continue;
+            }
+
+            self.save_repo_index(store, repo_path)?;
+            saved_count += 1;
+        }
+
+        Ok(saved_count)
+    }
+
+    fn save_repo_index(&self, store: &IndexStore, repo_path: &Path) -> Result<()> {
+        let repo_name = repo_id_from_path(repo_path);
+        let mut persisted = PersistedIndex::new(repo_path.to_path_buf());
+
+        let mut by_file: HashMap<String, Vec<Symbol>> = HashMap::new();
+        if let Some(symbols) = self.symbols.get(&repo_name) {
+            for sym in symbols.iter() {
+                by_file
+                    .entry(sym.file_path.clone())
+                    .or_default()
+                    .push(sym.clone());
+            }
+        }
+
+        for entry in self.file_cache.iter() {
+            let full_path = entry.key();
+            if owning_repo_root_for_path(&self.repo_paths, full_path).map(PathBuf::as_path)
+                != Some(repo_path)
+            {
+                continue;
+            }
+
+            let rel_path = full_path
+                .strip_prefix(repo_path)
+                .unwrap_or(full_path)
+                .to_string_lossy()
+                .to_string();
+            let file_symbols = by_file.remove(&rel_path).unwrap_or_default();
+
+            if let Some(file_metadata) =
+                file_metadata_for_path(full_path, Some(entry.value().as_bytes()), file_symbols)
+            {
+                persisted.files.insert(full_path.clone(), file_metadata);
+            }
+        }
+
+        // Preserve symbol-bearing files even if their content was not cached.
+        for (file_path, file_symbols) in by_file {
+            let full_path = repo_path.join(&file_path);
+            if let Some(file_metadata) = file_metadata_for_path(&full_path, None, file_symbols) {
+                persisted.files.insert(full_path, file_metadata);
+            }
+        }
+
+        store.save(&persisted)?;
+        info!(
+            "Saved index for {} ({} files)",
+            repo_name,
+            persisted.files.len()
+        );
+
+        Ok(())
     }
 
     /// Create a file watcher for the indexed repositories.
@@ -2181,6 +2204,7 @@ impl CodeIntelEngine {
         use crate::persist::ChangeType;
 
         let mut count = 0;
+        let mut changed_repos = HashSet::new();
 
         for change in changes {
             // notify can yield relative paths on some platforms/backends.
@@ -2231,6 +2255,7 @@ impl CodeIntelEngine {
                             .remove_file_with_id(&search_document_id(&repo_id, &rel_path));
                         self.query_cache.invalidate_for_file(&rel_path);
                         count += 1;
+                        changed_repos.insert(repo_path.clone());
                         continue;
                     }
 
@@ -2271,6 +2296,7 @@ impl CodeIntelEngine {
 
                         info!("Re-indexed file: {}", rel_path);
                         count += 1;
+                        changed_repos.insert(repo_path.clone());
                     }
                 }
                 ChangeType::Deleted => {
@@ -2295,13 +2321,14 @@ impl CodeIntelEngine {
 
                     info!("Removed file from index: {}", rel_path);
                     count += 1;
+                    changed_repos.insert(repo_path.clone());
                 }
             }
         }
 
         // Save index if persistence is enabled
         if self.options.persist_enabled && !self.options.persist_readonly && count > 0 {
-            let _ = self.save_index().await;
+            let _ = self.save_indexes_for_repos(&changed_repos);
         }
 
         Ok(count)

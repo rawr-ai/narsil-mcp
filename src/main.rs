@@ -371,18 +371,21 @@ async fn main() -> Result<()> {
     // Start background initialization task (indexing repos, git init)
     let init_engine = Arc::clone(&engine);
     let reindex_flag = server_args.reindex;
+    let (initialization_tx, initialization_rx) = tokio::sync::oneshot::channel();
     tokio::spawn(async move {
-        if reindex_flag {
+        let result = if reindex_flag {
             info!("Re-indexing all repositories...");
-            if let Err(e) = init_engine.reindex_all().await {
-                warn!("Error during re-indexing: {}", e);
-            }
+            init_engine.reindex_all().await
         } else {
             // Complete deferred initialization
-            if let Err(e) = init_engine.complete_initialization().await {
-                warn!("Error during background initialization: {}", e);
-            }
+            init_engine.complete_initialization().await
+        };
+
+        if let Err(e) = &result {
+            warn!("Error during background initialization: {}", e);
         }
+
+        let _ = initialization_tx.send(result.is_ok());
     });
 
     // Start watch mode in background if enabled
@@ -397,7 +400,7 @@ async fn main() -> Result<()> {
         let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel(1);
 
         tokio::spawn(async move {
-            run_watch_mode(watch_engine, shutdown_rx).await;
+            run_watch_mode(watch_engine, shutdown_rx, initialization_rx).await;
         });
 
         // Store shutdown sender for potential cleanup (not used currently but must be kept alive)
@@ -476,6 +479,7 @@ async fn main() -> Result<()> {
 async fn run_watch_mode(
     engine: Arc<index::CodeIntelEngine>,
     mut shutdown: tokio::sync::broadcast::Receiver<()>,
+    initialization: tokio::sync::oneshot::Receiver<bool>,
 ) {
     info!("Starting async watch mode background task");
 
@@ -486,6 +490,13 @@ async fn run_watch_mode(
             return;
         }
     };
+
+    info!("Watch mode waiting for background initialization");
+    if !wait_for_initialization(initialization, &mut shutdown).await {
+        warn!("Watch mode stopped before background initialization completed");
+        return;
+    }
+    info!("Background initialization complete; processing watch events");
 
     loop {
         tokio::select! {
@@ -511,5 +522,53 @@ async fn run_watch_mode(
                 break;
             }
         }
+    }
+}
+
+async fn wait_for_initialization(
+    initialization: tokio::sync::oneshot::Receiver<bool>,
+    shutdown: &mut tokio::sync::broadcast::Receiver<()>,
+) -> bool {
+    tokio::select! {
+        result = initialization => result.unwrap_or(false),
+        _ = shutdown.recv() => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::wait_for_initialization;
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn watch_processing_waits_for_successful_initialization() {
+        let (initialization_tx, initialization_rx) = tokio::sync::oneshot::channel();
+        let (_shutdown_tx, mut shutdown_rx) = tokio::sync::broadcast::channel(1);
+        let mut wait = Box::pin(wait_for_initialization(initialization_rx, &mut shutdown_rx));
+
+        assert!(tokio::time::timeout(Duration::from_millis(10), &mut wait)
+            .await
+            .is_err());
+
+        initialization_tx.send(true).unwrap();
+        assert!(wait.await);
+    }
+
+    #[tokio::test]
+    async fn watch_processing_stops_when_initialization_fails() {
+        let (initialization_tx, initialization_rx) = tokio::sync::oneshot::channel();
+        let (_shutdown_tx, mut shutdown_rx) = tokio::sync::broadcast::channel(1);
+
+        initialization_tx.send(false).unwrap();
+        assert!(!wait_for_initialization(initialization_rx, &mut shutdown_rx).await);
+    }
+
+    #[tokio::test]
+    async fn watch_processing_stops_when_shutdown_arrives_first() {
+        let (_initialization_tx, initialization_rx) = tokio::sync::oneshot::channel();
+        let (shutdown_tx, mut shutdown_rx) = tokio::sync::broadcast::channel(1);
+
+        shutdown_tx.send(()).unwrap();
+        assert!(!wait_for_initialization(initialization_rx, &mut shutdown_rx).await);
     }
 }

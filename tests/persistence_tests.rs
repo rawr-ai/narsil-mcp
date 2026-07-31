@@ -649,6 +649,61 @@ async fn test_process_file_changes_keeps_same_relative_path_in_other_repo() -> R
 }
 
 #[tokio::test]
+async fn test_process_file_changes_persists_only_changed_repo() -> Result<()> {
+    use narsil_mcp::index::{CodeIntelEngine, EngineOptions};
+    use narsil_mcp::persist::{ChangeType, FileChange, IndexStore};
+
+    let repo_a = TestRepo::new()?;
+    let repo_b = TestRepo::new()?;
+    repo_a.add_rust_file("src/lib.rs", "pub fn repo_a_before() {}")?;
+    repo_b.add_rust_file("src/lib.rs", "pub fn repo_b_unchanged() {}")?;
+
+    let index_dir = TempDir::new()?;
+    let repo_a_root = std::fs::canonicalize(repo_a.path())?;
+    let repo_b_root = std::fs::canonicalize(repo_b.path())?;
+    let options = EngineOptions {
+        git_enabled: false,
+        call_graph_enabled: false,
+        persist_enabled: true,
+        watch_enabled: true,
+        cache_enabled: false,
+        streaming_config: StreamingConfig::default(),
+        lsp_config: LspConfig::default(),
+        neural_config: NeuralConfig::default(),
+        ..Default::default()
+    };
+
+    let engine = CodeIntelEngine::with_options(
+        index_dir.path().to_path_buf(),
+        vec![repo_a_root.clone(), repo_b_root.clone()],
+        options,
+    )
+    .await?;
+    engine.complete_initialization().await?;
+
+    let store = IndexStore::new(index_dir.path().to_path_buf())?;
+    let repo_a_index = store.index_path(&repo_a_root);
+    let repo_b_index = store.index_path(&repo_b_root);
+    let repo_a_before = std::fs::read(&repo_a_index)?;
+    let repo_b_before = std::fs::read(&repo_b_index)?;
+
+    std::thread::sleep(std::time::Duration::from_secs(1));
+    repo_a.add_rust_file("src/lib.rs", "pub fn repo_a_after() {}")?;
+    let changed = engine
+        .process_file_changes(&[FileChange {
+            path: repo_a.path().join("src/lib.rs"),
+            change_type: ChangeType::Modified,
+        }])
+        .await?;
+
+    assert_eq!(changed, 1);
+    assert_ne!(std::fs::read(repo_a_index)?, repo_a_before);
+    assert_eq!(std::fs::read(repo_b_index)?, repo_b_before);
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn test_async_watcher_disabled_when_watch_disabled() -> Result<()> {
     use narsil_mcp::index::{CodeIntelEngine, EngineOptions};
 
