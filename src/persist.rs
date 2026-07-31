@@ -4,7 +4,7 @@
 
 use anyhow::{Context, Result};
 #[cfg(feature = "native")]
-use notify::{Config, Event, EventKind, PollWatcher, RecursiveMode, Watcher};
+use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -241,10 +241,10 @@ impl IndexStore {
     }
 }
 
-/// File watcher for incremental updates (legacy, sync-based polling)
+/// File watcher for incremental updates (legacy, sync-based interface)
 #[cfg(feature = "native")]
 pub struct FileWatcher {
-    watcher: PollWatcher,
+    watcher: RecommendedWatcher,
     rx: std::sync::mpsc::Receiver<Result<Event, notify::Error>>,
     watched_paths: Vec<PathBuf>,
 }
@@ -254,12 +254,12 @@ impl FileWatcher {
     pub fn new() -> Result<Self> {
         let (tx, rx) = std::sync::mpsc::channel();
 
-        let watcher = PollWatcher::new(
-            move |res| {
-                let _ = tx.send(res);
-            },
-            Config::default().with_poll_interval(Duration::from_millis(500)),
-        )?;
+        // Use the platform backend (FSEvents/inotify/ReadDirectoryChangesW).
+        // PollWatcher recursively stats the entire repository on every tick;
+        // directory-level native events are normalized below instead.
+        let watcher = notify::recommended_watcher(move |res| {
+            let _ = tx.send(res);
+        })?;
 
         Ok(Self {
             watcher,
@@ -338,7 +338,7 @@ impl FileWatcher {
 /// Async file watcher for event-driven incremental updates
 #[cfg(feature = "native")]
 pub struct AsyncFileWatcher {
-    _watcher: PollWatcher,
+    _watcher: RecommendedWatcher,
     watched_paths: Arc<RwLock<Vec<PathBuf>>>,
 }
 
@@ -353,12 +353,11 @@ impl AsyncFileWatcher {
         // Create a channel for the notify watcher
         let (notify_tx, mut notify_rx) = mpsc::unbounded_channel();
 
-        let watcher = PollWatcher::new(
-            move |res| {
-                let _ = notify_tx.send(res);
-            },
-            Config::default().with_poll_interval(Duration::from_millis(500)),
-        )?;
+        // Keep the async path on the same native backend as FileWatcher.
+        // Large repositories make periodic recursive polling prohibitively costly.
+        let watcher = notify::recommended_watcher(move |res| {
+            let _ = notify_tx.send(res);
+        })?;
 
         // Spawn a task to process notify events and send batched changes
         tokio::spawn(async move {
