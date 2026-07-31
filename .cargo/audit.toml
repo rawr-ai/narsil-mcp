@@ -1,0 +1,9 @@
+[advisories]
+# quick-xml is present only through the optional `graph` feature. The shipped
+# native/neural binary and CI test matrix do not compile Oxigraph, and Oxigraph
+# 0.5.9 still pins quick-xml 0.37. Remove these exceptions as soon as an
+# Oxigraph release accepts quick-xml 0.41 or newer.
+ignore = [
+  "RUSTSEC-2026-0194",
+  "RUSTSEC-2026-0195",
+]
