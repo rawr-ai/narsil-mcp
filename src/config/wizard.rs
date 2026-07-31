@@ -86,7 +86,7 @@ impl NeuralWizard {
 
         // Step 3: Select provider
         println!("\nSelect your embedding provider:\n");
-        println!("  1. Voyage AI (recommended for code, voyage-code-2)");
+        println!("  1. Voyage AI (recommended for code, voyage-code-3)");
         println!("  2. OpenAI (text-embedding-3-small or ada-002)");
         println!("  3. Custom endpoint (self-hosted or other provider)\n");
 

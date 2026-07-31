@@ -6,12 +6,13 @@ use anyhow::{anyhow, Context, Result};
 use dashmap::DashMap;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use sha2::{Digest, Sha256};
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::SystemTime;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::cache::query_cache::{QueryCache, QueryCacheKey, QueryCacheStats, SearchOptions};
 use crate::cache::{AnalysisCache, AnalysisCacheKey, CacheStats};
@@ -34,6 +35,7 @@ use crate::type_inference::{TypeError, TypeInferencer};
 /// Metadata about an indexed repository
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RepoMetadata {
+    pub repo_id: String,
     pub name: String,
     pub path: PathBuf,
     pub file_count: usize,
@@ -88,6 +90,8 @@ pub struct EngineOptions {
     pub call_graph_enabled: bool,
     /// Enable index persistence to disk
     pub persist_enabled: bool,
+    /// Enable index persistence in read-only mode (load only, never write)
+    pub persist_readonly: bool,
     /// Enable file watching for incremental updates
     pub watch_enabled: bool,
     /// Enable remote GitHub repository support (gates Remote-category tools).
@@ -119,6 +123,7 @@ impl Default for EngineOptions {
             git_enabled: false,
             call_graph_enabled: false,
             persist_enabled: false,
+            persist_readonly: false,
             watch_enabled: false,
             remote_enabled: false,
             streaming_config: StreamingConfig::default(),
@@ -142,6 +147,8 @@ pub struct CodeIntelEngine {
     repo_paths: Vec<PathBuf>,
     /// Cached repo metadata
     repos: DashMap<String, RepoMetadata>,
+    /// Alias map for repo resolution (repo_id/path/unique-basename -> repo_id)
+    repo_aliases: DashMap<String, String>,
     /// Symbol index: repo -> symbols
     symbols: DashMap<String, Vec<Symbol>>,
     /// File content cache (path -> content)
@@ -207,6 +214,14 @@ impl CodeIntelEngine {
         let expanded_repos: Vec<PathBuf> = repo_paths
             .iter()
             .map(|p| expand_path(p).unwrap_or_else(|_| p.clone()))
+            // Canonicalize to improve consistency across watchers/backends (e.g. /tmp vs /private/tmp on macOS)
+            .map(|p| {
+                if p.exists() {
+                    std::fs::canonicalize(&p).unwrap_or(p)
+                } else {
+                    p
+                }
+            })
             .collect();
 
         // Initialize index store for persistence if enabled
@@ -321,6 +336,7 @@ impl CodeIntelEngine {
             _index_path: expanded_index,
             repo_paths: expanded_repos.clone(),
             repos: DashMap::new(),
+            repo_aliases: DashMap::new(),
             symbols: DashMap::new(),
             file_cache: DashMap::new(),
             parser: Arc::new(LanguageParser::new()?),
@@ -351,11 +367,8 @@ impl CodeIntelEngine {
                 for repo_path in &expanded_repos {
                     if let Ok(persisted) = store.load_or_create(repo_path) {
                         if !persisted.files.is_empty() {
-                            let repo_name = repo_path
-                                .file_name()
-                                .and_then(|n| n.to_str())
-                                .unwrap_or("unknown")
-                                .to_string();
+                            let repo_name = repo_display_name(repo_path);
+                            let repo_id = repo_id_from_path(repo_path);
 
                             // Load symbols from persisted index
                             let symbols: Vec<Symbol> = persisted
@@ -367,7 +380,7 @@ impl CodeIntelEngine {
                             info!(
                                 "Loaded {} symbols from persisted index for {}",
                                 symbols.len(),
-                                repo_name
+                                repo_id
                             );
 
                             // Calculate metadata from persisted data
@@ -396,6 +409,7 @@ impl CodeIntelEngine {
                             }
 
                             let metadata = RepoMetadata {
+                                repo_id: repo_id.clone(),
                                 name: repo_name.clone(),
                                 path: repo_path.clone(),
                                 file_count: persisted.files.len(),
@@ -405,27 +419,25 @@ impl CodeIntelEngine {
                                     + std::time::Duration::from_secs(persisted.updated_at),
                             };
 
-                            engine.repos.insert(repo_name.clone(), metadata);
-                            engine.symbols.insert(repo_name.clone(), symbols);
-                            loaded_repos.push(repo_name);
+                            engine.repos.insert(repo_id.clone(), metadata);
+                            engine.symbols.insert(repo_id.clone(), symbols);
+                            loaded_repos.push(repo_id);
                         }
                     }
                 }
             }
         }
 
+        engine.rebuild_repo_aliases();
+
         // Initialize call graphs BEFORE indexing (must exist for index_repo to populate them)
         if options.call_graph_enabled {
             for repo_path in &expanded_repos {
                 if repo_path.exists() {
-                    let repo_name = repo_path
-                        .file_name()
-                        .and_then(|n| n.to_str())
-                        .unwrap_or("unknown")
-                        .to_string();
+                    let repo_id = repo_id_from_path(repo_path);
                     let call_graph = CallGraph::new();
-                    info!("Call graph initialized for repository: {}", repo_name);
-                    engine.call_graphs.insert(repo_name, call_graph);
+                    info!("Call graph initialized for repository: {}", repo_id);
+                    engine.call_graphs.insert(repo_id, call_graph);
                 }
             }
         }
@@ -460,15 +472,23 @@ impl CodeIntelEngine {
 
         // Index repos that weren't loaded from persistence
         for repo_path in &self.repo_paths {
-            let repo_name = repo_path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("unknown")
-                .to_string();
+            let repo_id = repo_id_from_path(repo_path);
 
             // Check if already loaded from persistence
-            if self.repos.contains_key(&repo_name) {
-                info!("Repository {} already loaded from cache", repo_name);
+            if self.repos.contains_key(&repo_id) {
+                info!(
+                    "Repository {} loaded from cache; hydrating volatile indexes",
+                    repo_id
+                );
+                if let Err(e) = self.hydrate_cached_repo(repo_path).await {
+                    warn!("Failed to hydrate cached repo {}: {}", repo_id, e);
+                }
+                if let Err(e) = self.sync_cached_repo_with_disk(repo_path) {
+                    warn!(
+                        "Failed to sync cached repo {} with disk state: {}",
+                        repo_id, e
+                    );
+                }
                 self.indexed_repos_count.fetch_add(1, Ordering::Release);
                 continue;
             }
@@ -489,19 +509,15 @@ impl CodeIntelEngine {
         if self.options.git_enabled {
             for repo_path in &self.repo_paths {
                 if repo_path.exists() {
-                    let repo_name = repo_path
-                        .file_name()
-                        .and_then(|n| n.to_str())
-                        .unwrap_or("unknown")
-                        .to_string();
+                    let repo_id = repo_id_from_path(repo_path);
 
                     match GitRepo::new(repo_path) {
                         Ok(git_repo) => {
-                            info!("Git enabled for repository: {}", repo_name);
-                            self.git_repos.insert(repo_name, git_repo);
+                            info!("Git enabled for repository: {}", repo_id);
+                            self.git_repos.insert(repo_id, git_repo);
                         }
                         Err(e) => {
-                            warn!("Failed to initialize git for {}: {}", repo_name, e);
+                            warn!("Failed to initialize git for {}: {}", repo_id, e);
                         }
                     }
                 }
@@ -511,7 +527,247 @@ impl CodeIntelEngine {
         self.initialization_complete.store(true, Ordering::Release);
         info!("Background initialization complete");
 
+        // Persist the freshly-built index so restarts can load from disk.
+        // Note: save failures should not crash the server; log and continue.
+        if self.options.persist_enabled && !self.options.persist_readonly {
+            match self.save_index().await {
+                Ok(msg) => info!("{}", msg),
+                Err(e) => warn!("Failed to persist index after initialization: {}", e),
+            }
+        }
+
         Ok(())
+    }
+
+    /// Hydrate in-memory indexes for a repository that was loaded from disk persistence.
+    ///
+    /// Persistence currently stores symbols and basic file metadata, but several in-memory
+    /// structures (file cache, search index, embedding indexes, call graph) are rebuilt at runtime.
+    /// This method rebuilds those structures without re-writing symbols/metadata.
+    async fn hydrate_cached_repo(&self, repo_root: &Path) -> Result<()> {
+        let repo_id = repo_id_from_path(repo_root);
+
+        // Rebuild TF-IDF embedding engine from persisted symbols/signatures.
+        if let Some(symbols) = self.symbols.get(&repo_id) {
+            for sym in symbols.iter() {
+                if let Some(ref sig) = sym.signature {
+                    let symbol_id = format!("{}::{}", sym.file_path, sym.name);
+                    self.embedding_engine.index_snippet(
+                        symbol_id.clone(),
+                        sym.file_path.clone(),
+                        sig.clone(),
+                        sym.start_line,
+                        sym.end_line,
+                    );
+                }
+            }
+        }
+
+        // Rebuild file cache + lexical search index from disk contents.
+        // Use ignore crate to respect .gitignore, consistent with indexing.
+        let walker = repo_walker(repo_root);
+
+        let mut trees_for_callgraph: Vec<(String, String, tree_sitter::Tree)> = Vec::new();
+
+        for entry in walker.filter_map(|e| e.ok()) {
+            if !entry.file_type().map(|ft| ft.is_file()).unwrap_or(false) {
+                continue;
+            }
+            let file_path = entry.path();
+            let Ok(content) = std::fs::read_to_string(file_path) else {
+                continue;
+            };
+
+            let rel_path = file_path
+                .strip_prefix(repo_root)
+                .unwrap_or(file_path)
+                .to_string_lossy()
+                .to_string();
+
+            self.file_cache
+                .insert(file_path.to_path_buf(), Arc::new(content.clone()));
+            self.search_index.index_file_with_id(
+                &search_document_id(&repo_id, &rel_path),
+                &rel_path,
+                &content,
+            );
+
+            if self.options.call_graph_enabled {
+                if let Ok(parsed) = self.parser.parse_file(file_path, &content) {
+                    if let Some(tree) = parsed.tree {
+                        trees_for_callgraph.push((rel_path, content, tree));
+                    }
+                }
+            }
+        }
+
+        // Rebuild call graph if enabled.
+        if self.options.call_graph_enabled {
+            self.call_graphs.insert(repo_id.clone(), CallGraph::new());
+            if let Some(call_graph) = self.call_graphs.get(&repo_id) {
+                if let Err(e) = call_graph.build_from_files(&trees_for_callgraph) {
+                    warn!("Failed to build call graph for {}: {}", repo_id, e);
+                } else {
+                    info!("Call graph built from persisted repo files for {}", repo_id);
+                }
+            }
+        }
+
+        // Rebuild neural embeddings if enabled (best-effort; errors shouldn't crash startup).
+        // Do not block hydration of later repo routes on API-backed neural rebuilds.
+        if let Some(ref neural) = self.neural_engine {
+            let mut neural_docs: Vec<crate::neural::NeuralDocument> = Vec::new();
+            if let Some(symbols) = self.symbols.get(&repo_id) {
+                for sym in symbols.iter() {
+                    if let Some(ref sig) = sym.signature {
+                        let symbol_id = format!("{}::{}", sym.file_path, sym.name);
+                        neural_docs.push(crate::neural::NeuralDocument {
+                            id: symbol_id,
+                            file_path: sym.file_path.clone(),
+                            content: sig.clone(),
+                            start_line: sym.start_line,
+                            end_line: sym.end_line,
+                            symbol_name: Some(sym.name.clone()),
+                        });
+                    }
+                }
+            }
+            if !neural_docs.is_empty() {
+                let neural = neural.clone();
+                let repo_id = repo_id.clone();
+                tokio::task::spawn_blocking(move || {
+                    let items: Vec<(crate::neural::NeuralDocument,)> =
+                        neural_docs.into_iter().map(|d| (d,)).collect();
+                    if let Err(e) = neural.index_batch(&items) {
+                        warn!("Failed to rebuild neural embeddings for {}: {}", repo_id, e);
+                    } else {
+                        info!(
+                            "Neural embeddings rebuilt from persisted symbols for {}",
+                            repo_id
+                        );
+                    }
+                });
+            }
+        }
+
+        Ok(())
+    }
+
+    /// When loading a repo from disk persistence, we still need to reconcile the persisted symbols
+    /// with the current filesystem state (new/modified/deleted files). Without this, a restart can
+    /// serve stale symbol results until watch mode catches up.
+    fn sync_cached_repo_with_disk(&self, repo_root: &Path) -> Result<usize> {
+        if !self.options.persist_enabled {
+            return Ok(0);
+        }
+
+        let Some(ref store) = self.index_store else {
+            return Ok(0);
+        };
+
+        let repo_id = repo_id_from_path(repo_root);
+        let persisted = store.load_or_create(repo_root)?;
+
+        // Collect current files (respect .gitignore, consistent with indexing).
+        let walker = repo_walker(repo_root);
+
+        let mut current_files: std::collections::HashSet<PathBuf> =
+            std::collections::HashSet::new();
+        for entry in walker.filter_map(|e| e.ok()) {
+            if !entry.file_type().map(|ft| ft.is_file()).unwrap_or(false) {
+                continue;
+            }
+            current_files.insert(entry.path().to_path_buf());
+        }
+
+        let mut deleted: Vec<PathBuf> = Vec::new();
+        let mut modified: Vec<PathBuf> = Vec::new();
+        for path in persisted.files.keys() {
+            if !path.exists() || !current_files.contains(path) {
+                deleted.push(path.clone());
+                continue;
+            }
+            if persisted.needs_reindex(path)? {
+                modified.push(path.clone());
+            }
+        }
+
+        let mut created: Vec<PathBuf> = Vec::new();
+        for path in current_files.iter() {
+            if !persisted.files.contains_key(path) {
+                created.push(path.clone());
+            }
+        }
+
+        if deleted.is_empty() && modified.is_empty() && created.is_empty() {
+            return Ok(0);
+        }
+
+        if self.symbols.get(&repo_id).is_none() {
+            self.symbols.insert(repo_id.clone(), Vec::new());
+        }
+
+        let mut changed = 0usize;
+
+        // Apply deletions first.
+        if !deleted.is_empty() {
+            if let Some(mut symbols) = self.symbols.get_mut(&repo_id) {
+                for abs_path in deleted {
+                    let rel_path = abs_path
+                        .strip_prefix(repo_root)
+                        .unwrap_or(&abs_path)
+                        .to_string_lossy()
+                        .to_string();
+                    symbols.retain(|s| s.file_path != rel_path);
+                    self.search_index
+                        .remove_file_with_id(&search_document_id(&repo_id, &rel_path));
+                    self.query_cache.invalidate_for_file(&rel_path);
+                    changed += 1;
+                }
+            }
+        }
+
+        // Apply modifications and creations.
+        let mut to_parse = Vec::new();
+        to_parse.extend(modified);
+        to_parse.extend(created);
+
+        if let Some(mut symbols) = self.symbols.get_mut(&repo_id) {
+            for abs_path in to_parse {
+                let Ok(content) = std::fs::read_to_string(&abs_path) else {
+                    continue;
+                };
+                let Ok(parsed) = self.parser.parse_file(&abs_path, &content) else {
+                    continue;
+                };
+
+                let rel_path = abs_path
+                    .strip_prefix(repo_root)
+                    .unwrap_or(&abs_path)
+                    .to_string_lossy()
+                    .to_string();
+
+                // Remove any old symbols for this file, then replace with the newly parsed set.
+                symbols.retain(|s| s.file_path != rel_path);
+                for mut symbol in parsed.symbols {
+                    symbol.file_path = rel_path.clone();
+                    symbols.push(symbol);
+                }
+
+                self.file_cache
+                    .insert(abs_path.clone(), Arc::new(content.clone()));
+                self.search_index.replace_file_with_id(
+                    &search_document_id(&repo_id, &rel_path),
+                    &rel_path,
+                    &content,
+                );
+                self.query_cache.invalidate_for_file(&rel_path);
+
+                changed += 1;
+            }
+        }
+
+        Ok(changed)
     }
 
     /// Check if background initialization has completed
@@ -566,26 +822,16 @@ impl CodeIntelEngine {
 
     async fn index_repo(&self, path: &Path) -> Result<()> {
         let start_time = std::time::Instant::now();
-        let repo_name = path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("unknown")
-            .to_string();
+        let repo_id = repo_id_from_path(path);
+        let repo_name = repo_display_name(path);
 
         let mut languages: HashMap<String, LanguageStats> = HashMap::new();
         let mut symbols_vec: Vec<Symbol> = Vec::new();
         let mut neural_docs: Vec<crate::neural::NeuralDocument> = Vec::new();
-        let mut file_count = 0;
         let mut total_lines = 0;
 
         // Use ignore crate to respect .gitignore
-        let walker = ignore::WalkBuilder::new(path)
-            .hidden(true)
-            .git_ignore(true)
-            .git_global(true)
-            .git_exclude(true)
-            .require_git(false)
-            .build();
+        let walker = repo_walker(path);
 
         let files: Vec<PathBuf> = walker
             .filter_map(|e| e.ok())
@@ -593,40 +839,60 @@ impl CodeIntelEngine {
             .map(|e| e.path().to_path_buf())
             .collect();
 
-        // Parse files in parallel
-        let metrics = Arc::clone(&self.metrics);
-        let parsed_results: Vec<_> = files
+        let readable_files: Vec<_> = files
             .par_iter()
             .filter_map(|file_path| {
-                let parse_start = std::time::Instant::now();
                 let content = std::fs::read_to_string(file_path).ok()?;
-                let parsed = self.parser.parse_file(file_path, &content).ok()?;
+                let relative_path = file_path
+                    .strip_prefix(path)
+                    .unwrap_or(file_path)
+                    .to_string_lossy()
+                    .to_string();
+                Some((file_path.clone(), relative_path, content))
+            })
+            .collect();
+
+        for (file_path, relative_path, content) in &readable_files {
+            self.file_cache
+                .insert(file_path.clone(), Arc::new(content.clone()));
+            self.search_index.index_file_with_id(
+                &search_document_id(&repo_id, relative_path),
+                relative_path,
+                content,
+            );
+
+            let lines = content.lines().count();
+            total_lines += lines;
+
+            let language = get_language_id(relative_path);
+            let lang_stats = languages.entry(language.to_string()).or_default();
+            lang_stats.file_count += 1;
+            lang_stats.line_count += lines;
+            lang_stats.byte_count += content.len();
+        }
+        let file_count = readable_files.len();
+
+        // Parse searchable files in parallel where NARSIL has language support.
+        let metrics = Arc::clone(&self.metrics);
+        let parsed_results: Vec<_> = readable_files
+            .par_iter()
+            .filter_map(|(file_path, relative_path, content)| {
+                let parse_start = std::time::Instant::now();
+                let parsed = self.parser.parse_file(file_path, content).ok()?;
                 metrics.record_file_parse(parse_start.elapsed());
-                Some((file_path.clone(), content, parsed))
+                Some((
+                    file_path.clone(),
+                    relative_path.clone(),
+                    content.clone(),
+                    parsed,
+                ))
             })
             .collect();
 
         // Collect parsed trees for call graph construction
         let mut trees_for_callgraph: Vec<(String, String, tree_sitter::Tree)> = Vec::new();
 
-        for (file_path, content, parsed) in parsed_results {
-            file_count += 1;
-            let lines = content.lines().count();
-            total_lines += lines;
-
-            // Update language stats
-            let lang_stats = languages.entry(parsed.language.clone()).or_default();
-            lang_stats.file_count += 1;
-            lang_stats.line_count += lines;
-            lang_stats.byte_count += content.len();
-
-            // Collect symbols with file path and index for embeddings
-            let relative_path = file_path
-                .strip_prefix(path)
-                .unwrap_or(&file_path)
-                .to_string_lossy()
-                .to_string();
-
+        for (_file_path, relative_path, content, parsed) in parsed_results {
             for mut symbol in parsed.symbols {
                 symbol.file_path = relative_path.clone();
 
@@ -657,13 +923,6 @@ impl CodeIntelEngine {
                 symbols_vec.push(symbol);
             }
 
-            // Cache file content
-            self.file_cache
-                .insert(file_path.clone(), Arc::new(content.clone()));
-
-            // Index file for semantic search
-            self.search_index.index_file(&relative_path, &content);
-
             // Collect tree for call graph if enabled and tree exists
             if self.options.call_graph_enabled {
                 if let Some(tree) = parsed.tree {
@@ -673,6 +932,7 @@ impl CodeIntelEngine {
         }
 
         let metadata = RepoMetadata {
+            repo_id: repo_id.clone(),
             name: repo_name.clone(),
             path: path.to_path_buf(),
             file_count,
@@ -685,7 +945,7 @@ impl CodeIntelEngine {
             "Indexed {} files, {} symbols in {}",
             file_count,
             symbols_vec.len(),
-            repo_name
+            repo_id
         );
 
         // Batch index neural embeddings if enabled
@@ -708,20 +968,21 @@ impl CodeIntelEngine {
         // Record indexing metrics
         let elapsed = start_time.elapsed();
         self.metrics
-            .record_repo_index(repo_name.clone(), elapsed, file_count, symbols_vec.len());
+            .record_repo_index(repo_id.clone(), elapsed, file_count, symbols_vec.len());
 
-        self.repos.insert(repo_name.clone(), metadata);
-        self.symbols.insert(repo_name.clone(), symbols_vec);
+        self.repos.insert(repo_id.clone(), metadata);
+        self.symbols.insert(repo_id.clone(), symbols_vec);
+        self.rebuild_repo_aliases();
 
         // Build call graph if enabled
         if self.options.call_graph_enabled && !trees_for_callgraph.is_empty() {
-            if let Some(call_graph) = self.call_graphs.get(&repo_name) {
+            if let Some(call_graph) = self.call_graphs.get(&repo_id) {
                 if let Err(e) = call_graph.build_from_files(&trees_for_callgraph) {
-                    warn!("Failed to build call graph for {}: {}", repo_name, e);
+                    warn!("Failed to build call graph for {}: {}", repo_id, e);
                 } else {
                     info!(
                         "Built call graph for {} with {} files",
-                        repo_name,
+                        repo_id,
                         trees_for_callgraph.len()
                     );
                 }
@@ -734,14 +995,10 @@ impl CodeIntelEngine {
             use crate::persistence::{RepositoryTransformer, SymbolTransformer};
 
             // Get the symbols we just indexed
-            if let Some(symbols) = self.symbols.get(&repo_name) {
+            if let Some(symbols) = self.symbols.get(&repo_id) {
                 let symbol_count = symbols.len();
-                if let Err(e) = SymbolTransformer::transform_many(graph, &repo_name, symbols.iter())
-                {
-                    warn!(
-                        "Failed to transform symbols to RDF for {}: {}",
-                        repo_name, e
-                    );
+                if let Err(e) = SymbolTransformer::transform_many(graph, &repo_id, symbols.iter()) {
+                    warn!("Failed to transform symbols to RDF for {}: {}", repo_id, e);
                 } else {
                     // Also add repository metadata
                     let file_paths: Vec<String> = symbols
@@ -752,17 +1009,17 @@ impl CodeIntelEngine {
                         .collect();
                     if let Err(e) = RepositoryTransformer::transform(
                         graph,
-                        &repo_name,
+                        &repo_id,
                         file_paths.iter().map(|s| s.as_str()),
                     ) {
                         warn!(
                             "Failed to transform repository metadata to RDF for {}: {}",
-                            repo_name, e
+                            repo_id, e
                         );
                     } else {
                         info!(
                             "Transformed {} symbols to RDF knowledge graph for {}",
-                            symbol_count, repo_name
+                            symbol_count, repo_id
                         );
                     }
                 }
@@ -774,6 +1031,7 @@ impl CodeIntelEngine {
 
     pub async fn reindex_all(&self) -> Result<()> {
         self.repos.clear();
+        self.repo_aliases.clear();
         self.symbols.clear();
         self.file_cache.clear();
         self.search_index.clear();
@@ -781,19 +1039,35 @@ impl CodeIntelEngine {
         // Clear all caches on full reindex
         self.analysis_cache.clear();
         self.query_cache.clear();
-        self.index_repos().await
+
+        self.index_repos().await?;
+
+        if self.options.persist_enabled && !self.options.persist_readonly {
+            let _ = self.save_index().await?;
+        }
+
+        Ok(())
     }
 
     pub async fn reindex(&self, repo: Option<&str>) -> Result<String> {
         match repo {
             Some(name) => {
+                let repo_id = self.resolve_repo_id(name)?;
                 let path = self.get_repo_path(name)?;
-                self.repos.remove(name);
-                self.symbols.remove(name);
-                // Invalidate caches for this repo only
-                self.query_cache.invalidate_for_repo(name);
+                self.remove_search_docs_for_repo_path(&path);
+                self.repos.remove(&repo_id);
+                self.symbols.remove(&repo_id);
+                self.call_graphs.remove(&repo_id);
+                self.git_repos.remove(&repo_id);
+                self.rebuild_repo_aliases();
+                // Invalidate cached query results for this repo only
+                self.query_cache.invalidate_for_repo(&repo_id);
                 self.index_repo(&path).await?;
-                Ok(format!("Re-indexed repository: {}", name))
+
+                if self.options.persist_enabled && !self.options.persist_readonly {
+                    let _ = self.save_index().await?;
+                }
+                Ok(format!("Re-indexed repository: {}", repo_id))
             }
             None => {
                 self.reindex_all().await?;
@@ -802,54 +1076,131 @@ impl CodeIntelEngine {
         }
     }
 
-    fn get_repo_path(&self, name: &str) -> Result<PathBuf> {
-        // Check for empty/missing repo parameter
-        if name.is_empty() {
-            let repo_names: Vec<_> = self.repos.iter().map(|r| r.key().clone()).collect();
-            if repo_names.is_empty() {
-                return Err(anyhow!(
-                    "Missing required 'repo' parameter. No repositories are indexed yet. \
-                     Use --repos flag when starting the server."
-                ));
+    fn remove_search_docs_for_repo_path(&self, repo_path: &Path) -> usize {
+        let rel_paths: Vec<String> = self
+            .file_cache
+            .iter()
+            .filter_map(|entry| {
+                let file_path = entry.key();
+                if !file_belongs_to_repo(&self.repo_paths, repo_path, file_path) {
+                    return None;
+                }
+
+                Some(
+                    file_path
+                        .strip_prefix(repo_path)
+                        .unwrap_or(file_path)
+                        .to_string_lossy()
+                        .to_string(),
+                )
+            })
+            .collect();
+
+        rel_paths
+            .iter()
+            .map(|rel_path| {
+                self.search_index.remove_file_with_id(&search_document_id(
+                    &repo_id_from_path(repo_path),
+                    rel_path,
+                ))
+            })
+            .sum()
+    }
+
+    fn resolve_repo_id(&self, input: &str) -> Result<String> {
+        if input.is_empty() {
+            return Err(self.repo_not_found_error(input));
+        }
+
+        if self.repos.contains_key(input) {
+            return Ok(input.to_string());
+        }
+
+        if let Some(mapped) = self.repo_aliases.get(input) {
+            return Ok(mapped.value().clone());
+        }
+
+        let as_path = PathBuf::from(input);
+        if as_path.exists() {
+            let canonical = as_path.canonicalize().unwrap_or(as_path.clone());
+            let canonical_str = canonical.to_string_lossy().to_string();
+            if let Some(mapped) = self.repo_aliases.get(&canonical_str) {
+                return Ok(mapped.value().clone());
             }
+            let raw_str = as_path.to_string_lossy().to_string();
+            if let Some(mapped) = self.repo_aliases.get(&raw_str) {
+                return Ok(mapped.value().clone());
+            }
+        }
+
+        let candidates: Vec<RepoMetadata> = self
+            .repos
+            .iter()
+            .filter(|entry| entry.value().name == input)
+            .map(|entry| entry.value().clone())
+            .collect();
+
+        if candidates.len() == 1 {
+            return Ok(candidates[0].repo_id.clone());
+        }
+
+        if candidates.len() > 1 {
+            let mut details: Vec<String> = candidates
+                .iter()
+                .map(|meta| format!("{} ({})", meta.repo_id, meta.path.display()))
+                .collect();
+            details.sort();
             return Err(anyhow!(
-                "Missing required 'repo' parameter. Available repositories: {}. \
-                 Use list_repos to see all indexed repositories.",
-                repo_names.join(", ")
+                "Repository name '{}' is ambiguous. Use one of: {}",
+                input,
+                details.join(", ")
             ));
         }
 
-        // If input looks like a path, validate it against indexed repos
-        if name.contains('/') || name.contains('\\') {
-            let as_path = PathBuf::from(name);
-            for entry in self.repos.iter() {
-                let repo_path = &entry.value().path;
-                // Compare non-canonical paths first (fast path)
-                if as_path == *repo_path || as_path.starts_with(repo_path) {
-                    return Ok(as_path);
-                }
-                // Compare canonical forms (handles symlinks like /var -> /private/var on macOS)
-                if let (Ok(canonical), Ok(repo_canonical)) =
-                    (as_path.canonicalize(), repo_path.canonicalize())
-                {
-                    if canonical == repo_canonical || canonical.starts_with(&repo_canonical) {
-                        return Ok(canonical);
-                    }
-                }
+        Err(self.repo_not_found_error(input))
+    }
+
+    fn rebuild_repo_aliases(&self) {
+        self.repo_aliases.clear();
+
+        let repos: Vec<RepoMetadata> = self
+            .repos
+            .iter()
+            .map(|entry| entry.value().clone())
+            .collect();
+        let mut basename_to_ids: HashMap<String, Vec<String>> = HashMap::new();
+
+        for meta in repos {
+            let repo_id = meta.repo_id.clone();
+            self.repo_aliases.insert(repo_id.clone(), repo_id.clone());
+
+            let raw_path = meta.path.to_string_lossy().to_string();
+            self.repo_aliases.insert(raw_path, repo_id.clone());
+
+            if let Ok(canonical) = meta.path.canonicalize() {
+                self.repo_aliases
+                    .insert(canonical.to_string_lossy().to_string(), repo_id.clone());
             }
-            // Path didn't match any indexed repo — fall through to name lookup
+
+            basename_to_ids
+                .entry(meta.name.clone())
+                .or_default()
+                .push(repo_id);
         }
 
-        // Look up by name
-        self.repos.get(name).map(|r| r.path.clone()).ok_or_else(|| {
-            let repo_names: Vec<_> = self.repos.iter().map(|r| r.key().clone()).collect();
-            anyhow!(
-                "Repository '{}' not found. Available repositories: {}. \
-                 Use list_repos to see all indexed repositories.",
-                name,
-                repo_names.join(", ")
-            )
-        })
+        for (basename, ids) in basename_to_ids {
+            if ids.len() == 1 {
+                self.repo_aliases.insert(basename, ids[0].clone());
+            }
+        }
+    }
+
+    fn get_repo_path(&self, name: &str) -> Result<PathBuf> {
+        let repo_id = self.resolve_repo_id(name)?;
+        self.repos
+            .get(&repo_id)
+            .map(|r| r.path.clone())
+            .ok_or_else(|| self.repo_not_found_error(name))
     }
 
     /// Get a reference to the engine options
@@ -897,7 +1248,7 @@ impl CodeIntelEngine {
             let mut file_info: Vec<(PathBuf, SystemTime)> = self
                 .file_cache
                 .iter()
-                .filter(|entry| entry.key().starts_with(&repo_path))
+                .filter(|entry| file_belongs_to_repo(&self.repo_paths, &repo_path, entry.key()))
                 .filter_map(|entry| {
                     let path = entry.key().clone();
                     std::fs::metadata(&path)
@@ -931,7 +1282,11 @@ impl CodeIntelEngine {
     /// Helper to create a helpful error message for missing/invalid repo parameter
     fn repo_not_found_error(&self, repo: &str) -> anyhow::Error {
         if repo.is_empty() {
-            let repo_names: Vec<_> = self.repos.iter().map(|r| r.key().clone()).collect();
+            let repo_names: Vec<_> = self
+                .repos
+                .iter()
+                .map(|r| format!("{} ({})", r.value().repo_id, r.value().path.display()))
+                .collect();
             if repo_names.is_empty() {
                 anyhow!(
                     "Missing required 'repo' parameter. No repositories are indexed yet. \
@@ -945,7 +1300,11 @@ impl CodeIntelEngine {
                 )
             }
         } else {
-            let repo_names: Vec<_> = self.repos.iter().map(|r| r.key().clone()).collect();
+            let repo_names: Vec<_> = self
+                .repos
+                .iter()
+                .map(|r| format!("{} ({})", r.value().repo_id, r.value().path.display()))
+                .collect();
             anyhow!(
                 "Repository '{}' not found. Available repositories: {}. \
                  Use list_repos to see all indexed repositories.",
@@ -961,8 +1320,9 @@ impl CodeIntelEngine {
 
         for entry in self.repos.iter() {
             let repo = entry.value();
-            output.push_str(&format!("## {}\n", repo.name));
+            output.push_str(&format!("## {} ({})\n", repo.repo_id, repo.name));
             output.push_str(&format!("- **Path**: {}\n", repo.path.display()));
+            output.push_str(&format!("- **Repo ID**: {}\n", repo.repo_id));
             output.push_str(&format!("- **Files**: {}\n", repo.file_count));
             output.push_str(&format!("- **Total Lines**: {}\n", repo.total_lines));
             output.push_str("- **Languages**:\n");
@@ -1051,6 +1411,7 @@ impl CodeIntelEngine {
         exclude_tests: Option<bool>,
     ) -> Result<String> {
         use crate::security_rules::is_test_file;
+        let repo_id = self.resolve_repo_id(repo)?;
 
         // Build cache key from query parameters
         let cache_key = {
@@ -1064,19 +1425,22 @@ impl CodeIntelEngine {
                 pattern.unwrap_or("*"),
                 symbol_type.unwrap_or("all")
             );
-            QueryCacheKey::code_search_with_options(Some(repo), query, &options)
+            QueryCacheKey::code_search_with_options(Some(&repo_id), query, &options)
         };
 
-        // Check cache first
-        if self.options.cache_enabled {
+        let cache_ready = self.initialization_complete.load(Ordering::Acquire);
+
+        // Check cache only after background hydration has completed. Before then,
+        // route-local file caches may still be filling and zero-result queries
+        // would otherwise poison later searches.
+        if self.options.cache_enabled && cache_ready {
             if let Some(cached) = self.query_cache.get(&cache_key) {
                 return Ok(cached);
             }
         }
-
         let symbols = self
             .symbols
-            .get(repo)
+            .get(&repo_id)
             .ok_or_else(|| self.repo_not_found_error(repo))?;
 
         let exclude_tests = exclude_tests.unwrap_or(false); // Default false for symbol search
@@ -1152,7 +1516,7 @@ impl CodeIntelEngine {
         }
 
         // Cache the result with file dependencies for smart invalidation
-        if self.options.cache_enabled {
+        if self.options.cache_enabled && cache_ready {
             self.query_cache
                 .insert_with_files(cache_key, output.clone(), dependent_files);
         }
@@ -1166,10 +1530,11 @@ impl CodeIntelEngine {
         symbol_name: &str,
         context_lines: usize,
     ) -> Result<String> {
+        let repo_id = self.resolve_repo_id(repo)?;
         let repo_path = self.get_repo_path(repo)?;
         let symbols = self
             .symbols
-            .get(repo)
+            .get(&repo_id)
             .ok_or_else(|| self.repo_not_found_error(repo))?;
 
         // Find matching symbol
@@ -1219,11 +1584,11 @@ impl CodeIntelEngine {
         for (i, line) in lines[start..end].iter().enumerate() {
             let line_num = start + i + 1;
             let marker = if line_num >= symbol.start_line && line_num <= symbol.end_line {
-                "â†’"
+                "->"
             } else {
-                " "
+                "  "
             };
-            output.push_str(&format!("{} {:4} â”‚ {}\n", marker, line_num, line));
+            output.push_str(&format!("{} {:4} | {}\n", marker, line_num, line));
         }
 
         output.push_str("```\n");
@@ -1280,7 +1645,7 @@ impl CodeIntelEngine {
                 let file_path = entry.key();
 
                 // Check if file is in this repo
-                if !file_path.starts_with(&repo_path) {
+                if !file_belongs_to_repo(&self.repo_paths, &repo_path, file_path) {
                     continue;
                 }
 
@@ -1400,7 +1765,7 @@ impl CodeIntelEngine {
         output.push('\n');
 
         for (i, line) in lines[start..end].iter().enumerate() {
-            output.push_str(&format!("{:4} â”‚ {}\n", start + i + 1, line));
+            output.push_str(&format!("{:4} | {}\n", start + i + 1, line));
         }
 
         output.push_str("```\n");
@@ -1481,7 +1846,7 @@ impl CodeIntelEngine {
 
         for entry in self.file_cache.iter() {
             let file_path = entry.key();
-            if !file_path.starts_with(repo_path) {
+            if !file_belongs_to_repo(&self.repo_paths, repo_path, file_path) {
                 continue;
             }
 
@@ -1510,7 +1875,8 @@ impl CodeIntelEngine {
         repo_path: &Path,
     ) -> Option<Vec<(String, usize, String)>> {
         let lsp = self.lsp_manager.as_ref()?;
-        let symbol_entry = self.symbols.get(repo)?;
+        let repo_id = self.resolve_repo_id(repo).ok()?;
+        let symbol_entry = self.symbols.get(&repo_id)?;
 
         for sym in symbol_entry.iter() {
             if sym.name == symbol || sym.qualified_name.as_deref() == Some(symbol) {
@@ -1621,7 +1987,7 @@ impl CodeIntelEngine {
 
             for entry in self.file_cache.iter() {
                 let fp = entry.key();
-                if !fp.starts_with(&repo_path) || fp == &file_path {
+                if !file_belongs_to_repo(&self.repo_paths, &repo_path, fp) || fp == &file_path {
                     continue;
                 }
 
@@ -1675,6 +2041,9 @@ impl CodeIntelEngine {
                 "Persistence is not enabled. Start with --persist flag to enable.".to_string(),
             );
         }
+        if self.options.persist_readonly {
+            return Ok("Persistence is enabled in read-only mode; skipping save.".to_string());
+        }
 
         let store = match &self.index_store {
             Some(s) => s,
@@ -1683,74 +2052,87 @@ impl CodeIntelEngine {
 
         let mut saved_count = 0;
         for repo_path in &self.repo_paths {
-            let repo_name = repo_path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("unknown")
-                .to_string();
-
-            // Create a persisted index from current state
-            let mut persisted = PersistedIndex::new(repo_path.clone());
-
-            // Populate with current symbols
-            if let Some(symbols) = self.symbols.get(&repo_name) {
-                // Group symbols by file path
-                let mut by_file: HashMap<String, Vec<Symbol>> = HashMap::new();
-                for sym in symbols.iter() {
-                    by_file
-                        .entry(sym.file_path.clone())
-                        .or_default()
-                        .push(sym.clone());
-                }
-
-                // Create file metadata for each file
-                for (file_path, file_symbols) in by_file {
-                    let full_path = repo_path.join(&file_path);
-                    if let Ok(metadata) = std::fs::metadata(&full_path) {
-                        let modified = metadata
-                            .modified()
-                            .ok()
-                            .and_then(|m| m.duration_since(SystemTime::UNIX_EPOCH).ok())
-                            .map(|d| d.as_secs())
-                            .unwrap_or(0);
-
-                        let content_hash = if let Ok(content) = std::fs::read(&full_path) {
-                            use sha2::{Digest, Sha256};
-                            let mut hasher = Sha256::new();
-                            hasher.update(&content);
-                            format!("{:x}", hasher.finalize())
-                        } else {
-                            String::new()
-                        };
-
-                        persisted.files.insert(
-                            full_path.clone(),
-                            crate::persist::FileMetadata {
-                                path: full_path,
-                                content_hash,
-                                modified_time: modified,
-                                size: metadata.len(),
-                                symbols: file_symbols,
-                            },
-                        );
-                    }
-                }
-            }
-
-            // Save the index
-            store.save(&persisted)?;
+            self.save_repo_index(store, repo_path)?;
             saved_count += 1;
-            info!(
-                "Saved index for {} ({} files)",
-                repo_name,
-                persisted.files.len()
-            );
         }
 
         Ok(format!(
             "Saved {} repository index(es) to disk successfully.",
             saved_count
         ))
+    }
+
+    fn save_indexes_for_repos(&self, repo_paths: &HashSet<PathBuf>) -> Result<usize> {
+        let store = self
+            .index_store
+            .as_ref()
+            .context("Persistence store is not initialized")?;
+        let mut saved_count = 0;
+
+        for repo_path in &self.repo_paths {
+            if !repo_paths.contains(repo_path) {
+                continue;
+            }
+
+            self.save_repo_index(store, repo_path)?;
+            saved_count += 1;
+        }
+
+        Ok(saved_count)
+    }
+
+    fn save_repo_index(&self, store: &IndexStore, repo_path: &Path) -> Result<()> {
+        let repo_name = repo_id_from_path(repo_path);
+        let mut persisted = PersistedIndex::new(repo_path.to_path_buf());
+
+        let mut by_file: HashMap<String, Vec<Symbol>> = HashMap::new();
+        if let Some(symbols) = self.symbols.get(&repo_name) {
+            for sym in symbols.iter() {
+                by_file
+                    .entry(sym.file_path.clone())
+                    .or_default()
+                    .push(sym.clone());
+            }
+        }
+
+        for entry in self.file_cache.iter() {
+            let full_path = entry.key();
+            if owning_repo_root_for_path(&self.repo_paths, full_path).map(PathBuf::as_path)
+                != Some(repo_path)
+            {
+                continue;
+            }
+
+            let rel_path = full_path
+                .strip_prefix(repo_path)
+                .unwrap_or(full_path)
+                .to_string_lossy()
+                .to_string();
+            let file_symbols = by_file.remove(&rel_path).unwrap_or_default();
+
+            if let Some(file_metadata) =
+                file_metadata_for_path(full_path, Some(entry.value().as_bytes()), file_symbols)
+            {
+                persisted.files.insert(full_path.clone(), file_metadata);
+            }
+        }
+
+        // Preserve symbol-bearing files even if their content was not cached.
+        for (file_path, file_symbols) in by_file {
+            let full_path = repo_path.join(&file_path);
+            if let Some(file_metadata) = file_metadata_for_path(&full_path, None, file_symbols) {
+                persisted.files.insert(full_path, file_metadata);
+            }
+        }
+
+        store.save(&persisted)?;
+        info!(
+            "Saved index for {} ({} files)",
+            repo_name,
+            persisted.files.len()
+        );
+
+        Ok(())
     }
 
     /// Create a file watcher for the indexed repositories.
@@ -1821,42 +2203,86 @@ impl CodeIntelEngine {
         use crate::persist::ChangeType;
 
         let mut count = 0;
+        let mut changed_repos = HashSet::new();
 
         for change in changes {
-            // Find which repo this file belongs to. Notify may emit canonical
-            // paths even when the user supplied a symlinked path (for example
-            // `/private/var/...` vs `/var/...` on macOS), so compare both raw
-            // and canonical forms.
-            let repo_path = self
-                .repo_paths
-                .iter()
-                .find(|p| path_is_within_repo(&change.path, p));
+            // notify can yield relative paths on some platforms/backends.
+            // Normalize to an absolute path so repo routing works reliably.
+            let change_path = if change.path.is_absolute() {
+                if change.path.exists() {
+                    std::fs::canonicalize(&change.path).unwrap_or_else(|_| change.path.clone())
+                } else {
+                    canonicalize_missing_path(&change.path).unwrap_or_else(|| change.path.clone())
+                }
+            } else {
+                let mut resolved: Option<PathBuf> = None;
+                for root in &self.repo_paths {
+                    let candidate = root.join(&change.path);
+                    // For deleted files the path may not exist; still accept the join.
+                    if candidate.exists() || matches!(change.change_type, ChangeType::Deleted) {
+                        resolved = Some(candidate);
+                        break;
+                    }
+                }
+                resolved.unwrap_or_else(|| change.path.clone())
+            };
+
+            // Find the most specific configured repo root this file belongs to.
+            let repo_path = owning_repo_root_for_path(&self.repo_paths, &change_path);
 
             let repo_path = match repo_path {
                 Some(p) => p,
                 None => continue,
             };
 
-            let repo_name = repo_path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("unknown")
+            let repo_id = repo_id_from_path(repo_path);
+            let rel_path = change_path
+                .strip_prefix(repo_path)
+                .unwrap_or(&change_path)
+                .to_string_lossy()
                 .to_string();
+            let change_type = if matches!(
+                change.change_type,
+                ChangeType::Created | ChangeType::Modified
+            ) && !change_path.exists()
+            {
+                ChangeType::Deleted
+            } else {
+                change.change_type.clone()
+            };
 
-            match change.change_type {
+            match change_type {
                 ChangeType::Created | ChangeType::Modified => {
-                    // Re-index the changed file
-                    if let Ok(content) = std::fs::read_to_string(&change.path) {
-                        if let Ok(parsed) = self.parser.parse_file(&change.path, &content) {
-                            let rel_path = change
-                                .path
-                                .strip_prefix(repo_path)
-                                .unwrap_or(&change.path)
-                                .to_string_lossy()
-                                .to_string();
+                    if !should_index_changed_file(repo_path, &change_path) {
+                        if self.remove_indexed_file_state(&repo_id, &rel_path, &change_path) {
+                            count += 1;
+                            changed_repos.insert(repo_path.clone());
+                        }
+                        continue;
+                    }
 
+                    // Re-index the changed file
+                    if let Ok(content) = std::fs::read_to_string(&change_path) {
+                        if self
+                            .file_cache
+                            .get(&change_path)
+                            .is_some_and(|cached| cached.value().as_str() == content.as_str())
+                        {
+                            debug!("Skipping unchanged file event: {}", rel_path);
+                            continue;
+                        }
+
+                        self.file_cache
+                            .insert(change_path.clone(), Arc::new(content.clone()));
+                        self.search_index.replace_file_with_id(
+                            &search_document_id(&repo_id, &rel_path),
+                            &rel_path,
+                            &content,
+                        );
+
+                        if let Ok(parsed) = self.parser.parse_file(&change_path, &content) {
                             // Update symbols for this file
-                            if let Some(mut symbols) = self.symbols.get_mut(&repo_name) {
+                            if let Some(mut symbols) = self.symbols.get_mut(&repo_id) {
                                 // Remove old symbols from this file
                                 symbols.retain(|s| s.file_path != rel_path);
 
@@ -1866,53 +2292,56 @@ impl CodeIntelEngine {
                                     symbols.push(symbol);
                                 }
                             }
-
-                            // Update file cache
-                            self.file_cache
-                                .insert(change.path.clone(), Arc::new(content.clone()));
-
-                            // Update search index
-                            self.search_index.index_file(&rel_path, &content);
-
-                            // Smart cache invalidation - only invalidate entries that depend on this file
-                            self.query_cache.invalidate_for_file(&rel_path);
-
-                            info!("Re-indexed file: {}", rel_path);
-                            count += 1;
+                        } else if let Some(mut symbols) = self.symbols.get_mut(&repo_id) {
+                            symbols.retain(|s| s.file_path != rel_path);
                         }
+
+                        // Smart cache invalidation - only invalidate entries that depend on this file
+                        self.query_cache.invalidate_for_file(&rel_path);
+
+                        info!("Re-indexed file: {}", rel_path);
+                        count += 1;
+                        changed_repos.insert(repo_path.clone());
                     }
                 }
                 ChangeType::Deleted => {
-                    let rel_path = change
-                        .path
-                        .strip_prefix(repo_path)
-                        .unwrap_or(&change.path)
-                        .to_string_lossy()
-                        .to_string();
-
-                    // Remove symbols for this file
-                    if let Some(mut symbols) = self.symbols.get_mut(&repo_name) {
-                        symbols.retain(|s| s.file_path != rel_path);
+                    if self.remove_indexed_file_state(&repo_id, &rel_path, &change_path) {
+                        info!("Removed file from index: {}", rel_path);
+                        count += 1;
+                        changed_repos.insert(repo_path.clone());
                     }
-
-                    // Remove from file cache
-                    self.file_cache.remove(&change.path);
-
-                    // Smart cache invalidation - only invalidate entries that depend on this file
-                    self.query_cache.invalidate_for_file(&rel_path);
-
-                    info!("Removed file from index: {}", rel_path);
-                    count += 1;
                 }
             }
         }
 
         // Save index if persistence is enabled
-        if self.options.persist_enabled && count > 0 {
-            let _ = self.save_index().await;
+        if self.options.persist_enabled && !self.options.persist_readonly && count > 0 {
+            let _ = self.save_indexes_for_repos(&changed_repos);
         }
 
         Ok(count)
+    }
+
+    fn remove_indexed_file_state(&self, repo_id: &str, rel_path: &str, change_path: &Path) -> bool {
+        let mut removed = false;
+
+        if let Some(mut symbols) = self.symbols.get_mut(repo_id) {
+            let before = symbols.len();
+            symbols.retain(|symbol| symbol.file_path != rel_path);
+            removed |= symbols.len() != before;
+        }
+
+        removed |= self.file_cache.remove(change_path).is_some();
+        removed |= self
+            .search_index
+            .remove_file_with_id(&search_document_id(repo_id, rel_path))
+            > 0;
+
+        if removed {
+            self.query_cache.invalidate_for_file(rel_path);
+        }
+
+        removed
     }
 
     // === Git Integration Methods ===
@@ -1926,12 +2355,13 @@ impl CodeIntelEngine {
         end_line: Option<usize>,
     ) -> Result<String> {
         let repo_path = self.get_repo_path(repo)?;
+        let repo_id = self.resolve_repo_id(repo)?;
         // Validate path to prevent traversal attacks
         validate_path(&repo_path, path)?;
 
         let git_repo = self
             .git_repos
-            .get(repo)
+            .get(&repo_id)
             .ok_or_else(|| anyhow!("Git not available for {}. Enable with --git flag.", repo))?;
 
         let blame = match (start_line, end_line) {
@@ -1950,12 +2380,13 @@ impl CodeIntelEngine {
         max_commits: usize,
     ) -> Result<String> {
         let repo_path = self.get_repo_path(repo)?;
+        let repo_id = self.resolve_repo_id(repo)?;
         // Validate path to prevent traversal attacks
         validate_path(&repo_path, path)?;
 
         let git_repo = self
             .git_repos
-            .get(repo)
+            .get(&repo_id)
             .ok_or_else(|| anyhow!("Git not available for {}. Enable with --git flag.", repo))?;
 
         let history = git_repo.file_history(path, max_commits)?;
@@ -1971,12 +2402,13 @@ impl CodeIntelEngine {
         max_commits: usize,
     ) -> Result<String> {
         let repo_path = self.get_repo_path(repo)?;
+        let repo_id = self.resolve_repo_id(repo)?;
         // Validate path to prevent traversal attacks
         validate_path(&repo_path, path)?;
 
         let git_repo = self
             .git_repos
-            .get(repo)
+            .get(&repo_id)
             .ok_or_else(|| anyhow!("Git not available for {}. Enable with --git flag.", repo))?;
 
         let history = git_repo.symbol_history(path, symbol, max_commits)?;
@@ -1991,6 +2423,7 @@ impl CodeIntelEngine {
         path: Option<&str>,
     ) -> Result<String> {
         let repo_path = self.get_repo_path(repo)?;
+        let repo_id = self.resolve_repo_id(repo)?;
         // Validate path to prevent traversal attacks
         if let Some(p) = path {
             validate_path(&repo_path, p)?;
@@ -1998,7 +2431,7 @@ impl CodeIntelEngine {
 
         let git_repo = self
             .git_repos
-            .get(repo)
+            .get(&repo_id)
             .ok_or_else(|| anyhow!("Git not available for {}. Enable with --git flag.", repo))?;
 
         let diff = git_repo.commit_diff(commit, path)?;
@@ -2017,9 +2450,10 @@ impl CodeIntelEngine {
 
     /// Get current branch and repository status
     pub async fn get_branch_info(&self, repo: &str) -> Result<String> {
+        let repo_id = self.resolve_repo_id(repo)?;
         let git_repo = self
             .git_repos
-            .get(repo)
+            .get(&repo_id)
             .ok_or_else(|| anyhow!("Git not available for {}. Enable with --git flag.", repo))?;
 
         let branch = git_repo.current_branch()?;
@@ -2044,9 +2478,10 @@ impl CodeIntelEngine {
 
     /// Get list of modified files in working tree
     pub async fn get_modified_files(&self, repo: &str) -> Result<String> {
+        let repo_id = self.resolve_repo_id(repo)?;
         let git_repo = self
             .git_repos
-            .get(repo)
+            .get(&repo_id)
             .ok_or_else(|| anyhow!("Git not available for {}. Enable with --git flag.", repo))?;
 
         let modified = git_repo.modified_files()?;
@@ -2068,9 +2503,10 @@ impl CodeIntelEngine {
 
     /// Get recent changes across the repository
     pub async fn get_recent_changes(&self, repo: &str, days: u32) -> Result<String> {
+        let repo_id = self.resolve_repo_id(repo)?;
         let git_repo = self
             .git_repos
-            .get(repo)
+            .get(&repo_id)
             .ok_or_else(|| anyhow!("Git not available for {}. Enable with --git flag.", repo))?;
 
         let changes = git_repo.recent_changes(days)?;
@@ -2100,9 +2536,10 @@ impl CodeIntelEngine {
         days: u32,
         _min_complexity: Option<usize>,
     ) -> Result<String> {
+        let repo_id = self.resolve_repo_id(repo)?;
         let git_repo = self
             .git_repos
-            .get(repo)
+            .get(&repo_id)
             .ok_or_else(|| anyhow!("Git not available for {}. Enable with --git flag.", repo))?;
 
         let freq = git_repo.change_frequency(days)?;
@@ -2127,6 +2564,7 @@ impl CodeIntelEngine {
     /// Get contributors to a file or repository
     pub async fn get_contributors(&self, repo: &str, path: Option<&str>) -> Result<String> {
         let repo_path = self.get_repo_path(repo)?;
+        let repo_id = self.resolve_repo_id(repo)?;
         // Validate path to prevent traversal attacks
         if let Some(p) = path {
             validate_path(&repo_path, p)?;
@@ -2134,7 +2572,7 @@ impl CodeIntelEngine {
 
         let git_repo = self
             .git_repos
-            .get(repo)
+            .get(&repo_id)
             .ok_or_else(|| anyhow!("Git not available for {}. Enable with --git flag.", repo))?;
 
         let mut output = String::new();
@@ -2338,19 +2776,27 @@ impl CodeIntelEngine {
             output.push_str(&format!("- {:?}: {}\n", doc_type, count));
         }
 
+        let repo_filter = match repo {
+            Some(r) if !r.is_empty() => Some(self.resolve_repo_id(r)?),
+            _ => None,
+        };
+
         output.push_str("\n## Repositories\n\n");
         for entry in self.repos.iter() {
             let meta = entry.value();
-            if repo.is_none() || repo == Some(entry.key()) {
+            if repo_filter.as_deref().is_none() || repo_filter.as_deref() == Some(entry.key()) {
                 output.push_str(&format!("### {}\n", meta.name));
                 output.push_str(&format!("- Files: {}\n", meta.file_count));
                 output.push_str(&format!(
                     "- Symbols: {}\n",
-                    self.symbols.get(&meta.name).map(|s| s.len()).unwrap_or(0)
+                    self.symbols
+                        .get(&meta.repo_id)
+                        .map(|s| s.len())
+                        .unwrap_or(0)
                 ));
                 output.push_str(&format!(
                     "- Git: {}\n\n",
-                    if self.git_repos.contains_key(&meta.name) {
+                    if self.git_repos.contains_key(&meta.repo_id) {
                         "enabled"
                     } else {
                         "disabled"
@@ -2532,10 +2978,11 @@ impl CodeIntelEngine {
         symbol_name: &str,
         max_results: usize,
     ) -> Result<String> {
+        let repo_id = self.resolve_repo_id(repo)?;
         // First find the symbol to get its ID
         let symbols = self
             .symbols
-            .get(repo)
+            .get(&repo_id)
             .ok_or_else(|| self.repo_not_found_error(repo))?;
 
         let symbol = symbols
@@ -2605,14 +3052,13 @@ impl CodeIntelEngine {
         _depth: usize,
         _exclude_tests: Option<bool>,
     ) -> Result<String> {
-        // Note: exclude_tests filtering would require call graph regeneration
-        // For now, the parameter is accepted but filtering happens at source
+        let repo_id = self.resolve_repo_id(repo)?;
 
         // Build cache key with function as discriminator
-        let cache_key = AnalysisCacheKey::with_discriminator(repo, "call_graph", function);
+        let cache_key = AnalysisCacheKey::with_discriminator(&repo_id, "call_graph", function);
 
         // Compute repo hash for invalidation
-        let repo_hash = self.compute_repo_hash(repo);
+        let repo_hash = self.compute_repo_hash(&repo_id);
 
         // Check cache first
         if self.options.cache_enabled {
@@ -2624,7 +3070,7 @@ impl CodeIntelEngine {
             }
         }
 
-        let call_graph = self.call_graphs.get(repo).ok_or_else(|| {
+        let call_graph = self.call_graphs.get(&repo_id).ok_or_else(|| {
             anyhow!(
                 "Call graph not available for {}. Enable with --call-graph flag.",
                 repo
@@ -2657,8 +3103,8 @@ impl CodeIntelEngine {
         max_depth: usize,
         _exclude_tests: Option<bool>,
     ) -> Result<String> {
-        // Note: exclude_tests filtering would require call graph regeneration
-        let call_graph = self.call_graphs.get(repo).ok_or_else(|| {
+        let repo_id = self.resolve_repo_id(repo)?;
+        let call_graph = self.call_graphs.get(&repo_id).ok_or_else(|| {
             anyhow!(
                 "Call graph not available for {}. Enable with --call-graph flag.",
                 repo
@@ -2707,8 +3153,8 @@ impl CodeIntelEngine {
         max_depth: usize,
         _exclude_tests: Option<bool>,
     ) -> Result<String> {
-        // Note: exclude_tests filtering would require call graph regeneration
-        let call_graph = self.call_graphs.get(repo).ok_or_else(|| {
+        let repo_id = self.resolve_repo_id(repo)?;
+        let call_graph = self.call_graphs.get(&repo_id).ok_or_else(|| {
             anyhow!(
                 "Call graph not available for {}. Enable with --call-graph flag.",
                 repo
@@ -2750,7 +3196,8 @@ impl CodeIntelEngine {
 
     /// Find the call path between two functions
     pub async fn find_call_path(&self, repo: &str, from: &str, to: &str) -> Result<String> {
-        let call_graph = self.call_graphs.get(repo).ok_or_else(|| {
+        let repo_id = self.resolve_repo_id(repo)?;
+        let call_graph = self.call_graphs.get(&repo_id).ok_or_else(|| {
             anyhow!(
                 "Call graph not available for {}. Enable with --call-graph flag.",
                 repo
@@ -2758,14 +3205,14 @@ impl CodeIntelEngine {
         })?;
 
         let mut output = String::new();
-        output.push_str(&format!("# Call Path: `{}` â†’ `{}`\n\n", from, to));
+        output.push_str(&format!("# Call Path: `{}` -> `{}`\n\n", from, to));
 
         match call_graph.find_call_path(from, to) {
             Some(path) => {
                 output.push_str(&format!("Found path with {} steps:\n\n", path.len() - 1));
                 for (i, func) in path.iter().enumerate() {
                     if i > 0 {
-                        output.push_str("  â†“\n");
+                        output.push_str("  |\n  v\n");
                     }
                     output.push_str(&format!("{}. `{}`\n", i + 1, func));
                 }
@@ -2780,7 +3227,8 @@ impl CodeIntelEngine {
 
     /// Get complexity metrics for a function
     pub async fn get_complexity(&self, repo: &str, function: &str) -> Result<String> {
-        let call_graph = self.call_graphs.get(repo).ok_or_else(|| {
+        let repo_id = self.resolve_repo_id(repo)?;
+        let call_graph = self.call_graphs.get(&repo_id).ok_or_else(|| {
             anyhow!(
                 "Call graph not available for {}. Enable with --call-graph flag.",
                 repo
@@ -2810,15 +3258,21 @@ impl CodeIntelEngine {
                 // Add health assessment
                 output.push_str("\n## Health Assessment\n\n");
                 if metrics.cyclomatic > 10 {
-                    output.push_str("âš ï¸ **High cyclomatic complexity** - Consider refactoring into smaller functions.\n");
+                    output.push_str(
+                        "WARN: High cyclomatic complexity - Consider refactoring into smaller functions.\n",
+                    );
                 } else if metrics.cyclomatic > 5 {
-                    output.push_str("âš¡ **Moderate complexity** - Function is manageable but could be simplified.\n");
+                    output.push_str(
+                        "NOTE: Moderate complexity - Function is manageable but could be simplified.\n",
+                    );
                 } else {
-                    output.push_str("âœ… **Low complexity** - Function is well-structured.\n");
+                    output.push_str("OK: Low complexity - Function is well-structured.\n");
                 }
 
                 if metrics.max_depth > 4 {
-                    output.push_str("âš ï¸ **Deep nesting** - Consider early returns or extracting nested logic.\n");
+                    output.push_str(
+                        "WARN: Deep nesting - Consider early returns or extracting nested logic.\n",
+                    );
                 }
             }
             None => {
@@ -2836,8 +3290,8 @@ impl CodeIntelEngine {
         min_connections: usize,
         _exclude_tests: Option<bool>,
     ) -> Result<String> {
-        // Note: exclude_tests filtering would require call graph regeneration
-        let call_graph = self.call_graphs.get(repo).ok_or_else(|| {
+        let repo_id = self.resolve_repo_id(repo)?;
+        let call_graph = self.call_graphs.get(&repo_id).ok_or_else(|| {
             anyhow!(
                 "Call graph not available for {}. Enable with --call-graph flag.",
                 repo
@@ -3006,6 +3460,7 @@ impl CodeIntelEngine {
         line: usize,
         character: usize,
     ) -> Result<String> {
+        let repo_id = self.resolve_repo_id(repo)?;
         let repo_path = self.get_repo_path(repo)?;
         let file_path = validate_path(&repo_path, path)?;
 
@@ -3041,7 +3496,7 @@ impl CodeIntelEngine {
         output.push_str("## Symbol Information (tree-sitter)\n\n");
         let symbols = self
             .symbols
-            .get(repo)
+            .get(&repo_id)
             .ok_or_else(|| self.repo_not_found_error(repo))?;
 
         // Find symbol at this location
@@ -3112,6 +3567,7 @@ impl CodeIntelEngine {
         line: usize,
         character: usize,
     ) -> Result<String> {
+        let repo_id = self.resolve_repo_id(repo)?;
         let repo_path = self.get_repo_path(repo)?;
         let file_path = validate_path(&repo_path, path)?;
         let language = get_language_from_path(path);
@@ -3175,7 +3631,7 @@ impl CodeIntelEngine {
         if line > 0 && line <= lines.len() {
             let source_line = lines[line - 1];
             // Try to find a symbol at or near the character position
-            if let Some(symbols) = self.symbols.get(repo) {
+            if let Some(symbols) = self.symbols.get(&repo_id) {
                 for symbol in symbols.iter() {
                     if source_line.contains(&symbol.name) {
                         output.push_str(&format!(
@@ -3349,9 +3805,10 @@ impl CodeIntelEngine {
 
     /// Get control flow graph for a specific function
     pub async fn get_control_flow(&self, repo: &str, path: &str, function: &str) -> Result<String> {
+        let repo_id = self.resolve_repo_id(repo)?;
         let repo_meta = self
             .repos
-            .get(repo)
+            .get(&repo_id)
             .ok_or_else(|| anyhow!("Repository '{}' not found", repo))?;
 
         let full_path = validate_path(&repo_meta.path, path)?;
@@ -3401,14 +3858,17 @@ impl CodeIntelEngine {
         use crate::dead_code;
         use crate::security_rules::is_test_file;
 
+        let repo_id = self.resolve_repo_id(repo)?;
         let exclude_tests = exclude_tests.unwrap_or(true);
         if exclude_tests && is_test_file(path) {
-            return Ok(format!("# Dead Code Analysis: `{}`\n\nSkipped: test file (use exclude_tests=false to include)", path));
+            return Ok(format!(
+                "# Dead Code Analysis: `{}`\n\nSkipped: test file (use exclude_tests=false to include)",
+                path
+            ));
         }
-
         let repo_meta = self
             .repos
-            .get(repo)
+            .get(&repo_id)
             .ok_or_else(|| anyhow!("Repository '{}' not found", repo))?;
 
         let full_path = validate_path(&repo_meta.path, path)?;
@@ -3439,9 +3899,10 @@ impl CodeIntelEngine {
 
     /// Get data flow analysis for a specific function
     pub async fn get_data_flow(&self, repo: &str, path: &str, function: &str) -> Result<String> {
+        let repo_id = self.resolve_repo_id(repo)?;
         let repo_meta = self
             .repos
-            .get(repo)
+            .get(&repo_id)
             .ok_or_else(|| anyhow!("Repository '{}' not found", repo))?;
 
         let full_path = validate_path(&repo_meta.path, path)?;
@@ -3470,9 +3931,10 @@ impl CodeIntelEngine {
         path: &str,
         function: &str,
     ) -> Result<String> {
+        let repo_id = self.resolve_repo_id(repo)?;
         let repo_meta = self
             .repos
-            .get(repo)
+            .get(&repo_id)
             .ok_or_else(|| anyhow!("Repository '{}' not found", repo))?;
 
         let full_path = validate_path(&repo_meta.path, path)?;
@@ -3528,14 +3990,17 @@ impl CodeIntelEngine {
     ) -> Result<String> {
         use crate::security_rules::is_test_file;
 
+        let repo_id = self.resolve_repo_id(repo)?;
         let exclude_tests = exclude_tests.unwrap_or(true);
         if exclude_tests && is_test_file(path) {
-            return Ok(format!("# Uninitialized Variable Analysis: `{}`\n\nSkipped: test file (use exclude_tests=false to include)", path));
+            return Ok(format!(
+                "# Uninitialized Variable Analysis: `{}`\n\nSkipped: test file (use exclude_tests=false to include)",
+                path
+            ));
         }
-
         let repo_meta = self
             .repos
-            .get(repo)
+            .get(&repo_id)
             .ok_or_else(|| anyhow!("Repository '{}' not found", repo))?;
 
         let full_path = validate_path(&repo_meta.path, path)?;
@@ -3600,14 +4065,17 @@ impl CodeIntelEngine {
     ) -> Result<String> {
         use crate::security_rules::is_test_file;
 
+        let repo_id = self.resolve_repo_id(repo)?;
         let exclude_tests = exclude_tests.unwrap_or(true);
         if exclude_tests && is_test_file(path) {
-            return Ok(format!("# Dead Store Analysis: `{}`\n\nSkipped: test file (use exclude_tests=false to include)", path));
+            return Ok(format!(
+                "# Dead Store Analysis: `{}`\n\nSkipped: test file (use exclude_tests=false to include)",
+                path
+            ));
         }
-
         let repo_meta = self
             .repos
-            .get(repo)
+            .get(&repo_id)
             .ok_or_else(|| anyhow!("Repository '{}' not found", repo))?;
 
         let full_path = validate_path(&repo_meta.path, path)?;
@@ -3701,7 +4169,7 @@ impl CodeIntelEngine {
 
             for file_entry in self.file_cache.iter() {
                 let file_path = file_entry.key();
-                if !file_path.starts_with(repo_path) {
+                if !file_belongs_to_repo(&self.repo_paths, repo_path, file_path) {
                     continue;
                 }
                 // Skip test files if exclude_tests is enabled
@@ -3829,7 +4297,7 @@ impl CodeIntelEngine {
                     continue;
                 }
                 let file_path = file_entry.key();
-                if !file_path.starts_with(repo_path) {
+                if !file_belongs_to_repo(&self.repo_paths, repo_path, file_path) {
                     continue;
                 }
 
@@ -3936,9 +4404,10 @@ impl CodeIntelEngine {
     ) -> Result<String> {
         use crate::chunking::{AstChunker, ChunkerConfig, ChunkingStats};
 
+        let repo_id = self.resolve_repo_id(repo)?;
         let repo_meta = self
             .repos
-            .get(repo)
+            .get(&repo_id)
             .ok_or_else(|| anyhow!("Repository '{}' not found", repo))?;
 
         let full_path = validate_path(&repo_meta.path, path)?;
@@ -4005,9 +4474,10 @@ impl CodeIntelEngine {
     pub async fn get_chunk_stats(&self, repo: &str) -> Result<String> {
         use crate::chunking::{AstChunker, ChunkingStats};
 
+        let repo_id = self.resolve_repo_id(repo)?;
         let repo_meta = self
             .repos
-            .get(repo)
+            .get(&repo_id)
             .ok_or_else(|| anyhow!("Repository '{}' not found", repo))?;
 
         let repo_path = repo_meta.path.clone();
@@ -4019,7 +4489,7 @@ impl CodeIntelEngine {
 
         for file_entry in self.file_cache.iter() {
             let file_path = file_entry.key();
-            if !file_path.starts_with(&repo_path) {
+            if !file_belongs_to_repo(&self.repo_paths, &repo_path, file_path) {
                 continue;
             }
 
@@ -4146,7 +4616,7 @@ impl CodeIntelEngine {
         let files_to_analyze: Vec<std::path::PathBuf> = self
             .file_cache
             .iter()
-            .filter(|entry| entry.key().starts_with(&repo_path))
+            .filter(|entry| file_belongs_to_repo(&self.repo_paths, &repo_path, entry.key()))
             .filter(|entry| {
                 if let Some(specific_path) = path {
                     // Support both file and directory paths by checking if path matches
@@ -4393,7 +4863,7 @@ impl CodeIntelEngine {
         let files_to_analyze: Vec<std::path::PathBuf> = self
             .file_cache
             .iter()
-            .filter(|entry| entry.key().starts_with(&repo_path))
+            .filter(|entry| file_belongs_to_repo(&self.repo_paths, &repo_path, entry.key()))
             .filter(|entry| {
                 if let Some(specific_path) = path {
                     // Support both file and directory paths by checking if path matches
@@ -4552,7 +5022,7 @@ impl CodeIntelEngine {
         let files: Vec<(std::path::PathBuf, Arc<String>)> = self
             .file_cache
             .iter()
-            .filter(|entry| entry.key().starts_with(&repo_path))
+            .filter(|entry| file_belongs_to_repo(&self.repo_paths, &repo_path, entry.key()))
             .filter(|entry| !exclude_tests || !is_test_file(&entry.key().to_string_lossy()))
             .filter(|entry| !is_security_exemplar_file(&entry.key().to_string_lossy()))
             .filter(|entry| {
@@ -4762,7 +5232,7 @@ impl CodeIntelEngine {
         let files: Vec<_> = self
             .file_cache
             .iter()
-            .filter(|e| e.key().starts_with(&repo_path))
+            .filter(|e| file_belongs_to_repo(&self.repo_paths, &repo_path, e.key()))
             .filter(|e| path.is_none_or(|p| e.key().to_string_lossy().contains(p)))
             .filter(|e| !exclude_tests || !is_test_file(&e.key().to_string_lossy()))
             .filter(|e| !is_security_exemplar_file(&e.key().to_string_lossy()))
@@ -4889,7 +5359,7 @@ impl CodeIntelEngine {
         let files: Vec<_> = self
             .file_cache
             .iter()
-            .filter(|e| e.key().starts_with(&repo_path))
+            .filter(|e| file_belongs_to_repo(&self.repo_paths, &repo_path, e.key()))
             .filter(|e| path.is_none_or(|p| e.key().to_string_lossy().contains(p)))
             .filter(|e| !exclude_tests || !is_test_file(&e.key().to_string_lossy()))
             .filter(|e| !is_security_exemplar_file(&e.key().to_string_lossy()))
@@ -4952,7 +5422,7 @@ impl CodeIntelEngine {
         let files: Vec<_> = self
             .file_cache
             .iter()
-            .filter(|e| e.key().starts_with(&repo_path))
+            .filter(|e| file_belongs_to_repo(&self.repo_paths, &repo_path, e.key()))
             .filter(|e| path.is_none_or(|p| e.key().to_string_lossy().contains(p)))
             .filter(|e| !exclude_tests || !is_test_file(&e.key().to_string_lossy()))
             .filter(|e| !is_security_exemplar_file(&e.key().to_string_lossy()))
@@ -5661,10 +6131,11 @@ impl CodeIntelEngine {
         file: Option<&str>,
         direction: &str,
     ) -> Result<String> {
+        let repo_id = self.resolve_repo_id(repo_name)?;
         let repo_path = self.get_repo_path(repo_name)?;
         let symbols = self
             .symbols
-            .get(repo_name)
+            .get(&repo_id)
             .map(|s| s.clone())
             .unwrap_or_default();
 
@@ -5770,11 +6241,12 @@ impl CodeIntelEngine {
     ) -> Result<String> {
         use crate::security_rules::is_test_file;
 
+        let repo_id = self.resolve_repo_id(repo_name)?;
         let repo_path = self.get_repo_path(repo_name)?;
         let exclude_tests = exclude_tests.unwrap_or(true);
         let symbols = self
             .symbols
-            .get(repo_name)
+            .get(&repo_id)
             .map(|s| s.clone())
             .unwrap_or_default();
 
@@ -6024,15 +6496,20 @@ impl CodeIntelEngine {
 
     /// Get incremental indexing status
     pub async fn get_incremental_status(&self, repo_name: &str) -> Result<String> {
+        let repo_id = self.resolve_repo_id(repo_name)?;
         let repo_path = self.get_repo_path(repo_name)?;
 
         let mut output = String::new();
         output.push_str(&format!("# Incremental Index Status: {}\n\n", repo_name));
 
         // Count files and symbols
-        let symbol_count = self.symbols.get(repo_name).map(|s| s.len()).unwrap_or(0);
+        let symbol_count = self.symbols.get(&repo_id).map(|s| s.len()).unwrap_or(0);
 
-        let file_count = self.file_cache.len();
+        let file_count = self
+            .file_cache
+            .iter()
+            .filter(|entry| file_belongs_to_repo(&self.repo_paths, &repo_path, entry.key()))
+            .count();
 
         output.push_str("## Index Statistics\n\n");
         output.push_str(&format!("- **Repository**: {}\n", repo_path.display()));
@@ -6061,7 +6538,7 @@ impl CodeIntelEngine {
         }
 
         // Symbol breakdown by kind
-        if let Some(symbols) = self.symbols.get(repo_name) {
+        if let Some(symbols) = self.symbols.get(&repo_id) {
             output.push_str("\n## Symbol Breakdown\n\n");
             let mut by_kind: std::collections::HashMap<crate::symbols::SymbolKind, usize> =
                 std::collections::HashMap::new();
@@ -6090,11 +6567,12 @@ impl CodeIntelEngine {
     ) -> Result<String> {
         use crate::security_rules::is_test_file;
 
+        let repo_id = self.resolve_repo_id(repo_name)?;
         let repo_path = self.get_repo_path(repo_name)?;
         let exclude_tests = exclude_tests.unwrap_or(false); // Default false for symbol search
         let symbols = self
             .symbols
-            .get(repo_name)
+            .get(&repo_id)
             .map(|s| s.clone())
             .unwrap_or_default();
 
@@ -6120,7 +6598,7 @@ impl CodeIntelEngine {
             let path = entry.key();
             let content = entry.value();
 
-            if !path.starts_with(&repo_path) {
+            if !file_belongs_to_repo(&self.repo_paths, &repo_path, path) {
                 continue;
             }
 
@@ -6183,6 +6661,7 @@ impl CodeIntelEngine {
 
     /// Get export map for a file
     pub async fn get_export_map(&self, repo_name: &str, path: &str) -> Result<String> {
+        let repo_id = self.resolve_repo_id(repo_name)?;
         let repo_path = self.get_repo_path(repo_name)?;
         let file_path = validate_path(&repo_path, path)?;
 
@@ -6190,7 +6669,7 @@ impl CodeIntelEngine {
 
         let symbols = self
             .symbols
-            .get(repo_name)
+            .get(&repo_id)
             .map(|s| s.clone())
             .unwrap_or_default();
 
@@ -6334,6 +6813,7 @@ impl CodeIntelEngine {
             .ok_or_else(|| anyhow!("Neural search not available. Enable with --neural flag."))?;
 
         // Get the symbol's code
+        let repo_id = self.resolve_repo_id(repo)?;
         let repo_path = self.get_repo_path(repo)?;
         let file_path = validate_path(&repo_path, path)?;
         let content = std::fs::read_to_string(&file_path)?;
@@ -6341,7 +6821,7 @@ impl CodeIntelEngine {
         // Find the symbol in our index
         let symbols = self
             .symbols
-            .get(repo)
+            .get(&repo_id)
             .ok_or_else(|| anyhow!("Repository not indexed"))?;
         let symbol = symbols
             .iter()
@@ -6434,9 +6914,10 @@ impl CodeIntelEngine {
 
     /// Infer types for a Python/JavaScript function
     pub async fn infer_types(&self, repo: &str, path: &str, function: &str) -> Result<String> {
+        let repo_id = self.resolve_repo_id(repo)?;
         let repo_meta = self
             .repos
-            .get(repo)
+            .get(&repo_id)
             .ok_or_else(|| anyhow!("Repository '{}' not found", repo))?;
 
         let full_path = validate_path(&repo_meta.path, path)?;
@@ -6487,14 +6968,17 @@ impl CodeIntelEngine {
     ) -> Result<String> {
         use crate::security_rules::is_test_file;
 
+        let repo_id = self.resolve_repo_id(repo)?;
         let exclude_tests = exclude_tests.unwrap_or(true);
         if exclude_tests && is_test_file(path) {
-            return Ok(format!("# Type Error Analysis: `{}`\n\nSkipped: test file (use exclude_tests=false to include)", path));
+            return Ok(format!(
+                "# Type Error Analysis: `{}`\n\nSkipped: test file (use exclude_tests=false to include)",
+                path
+            ));
         }
-
         let repo_meta = self
             .repos
-            .get(repo)
+            .get(&repo_id)
             .ok_or_else(|| anyhow!("Repository '{}' not found", repo))?;
 
         let full_path = validate_path(&repo_meta.path, path)?;
@@ -6647,9 +7131,10 @@ impl CodeIntelEngine {
         path: &str,
         source_line: usize,
     ) -> Result<String> {
+        let repo_id = self.resolve_repo_id(repo)?;
         let repo_meta = self
             .repos
-            .get(repo)
+            .get(&repo_id)
             .ok_or_else(|| anyhow!("Repository '{}' not found", repo))?;
 
         let full_path = validate_path(&repo_meta.path, path)?;
@@ -6835,7 +7320,7 @@ impl CodeIntelEngine {
                 .map(|e| e.key().clone())
                 .ok_or_else(|| anyhow!("No repositories indexed with call graphs"))?
         } else {
-            repo.to_string()
+            self.resolve_repo_id(repo)?
         };
 
         self.call_graphs
@@ -6949,10 +7434,11 @@ impl CodeIntelEngine {
         symbol_name: &str,
         max_nodes: usize,
     ) -> Result<crate::tool_handlers::graph::SymbolGraphData> {
+        let repo_id = self.resolve_repo_id(repo)?;
         // Find the symbol definition
         let symbols = self
             .symbols
-            .get(repo)
+            .get(&repo_id)
             .ok_or_else(|| anyhow!("Repository not indexed: {}", repo))?;
 
         let target_symbol = symbols
@@ -6980,7 +7466,7 @@ impl CodeIntelEngine {
             }
 
             let file_path = entry.key();
-            if !file_path.starts_with(&repo_path) {
+            if !file_belongs_to_repo(&self.repo_paths, &repo_path, file_path) {
                 continue;
             }
 
@@ -7026,15 +7512,16 @@ impl CodeIntelEngine {
         repo: &str,
         function: &str,
     ) -> Result<crate::tool_handlers::graph::CfgData> {
+        let repo_id = self.resolve_repo_id(repo)?;
         let repo_meta = self
             .repos
-            .get(repo)
+            .get(&repo_id)
             .ok_or_else(|| anyhow!("Repository '{}' not found", repo))?;
 
         // Find the function in symbols
         let symbols = self
             .symbols
-            .get(repo)
+            .get(&repo_id)
             .ok_or_else(|| anyhow!("No symbols for repository: {}", repo))?;
 
         let func_symbol = symbols
@@ -7665,7 +8152,7 @@ impl CodeIntelEngine {
         let files: Vec<FileInfo> = self
             .file_cache
             .iter()
-            .filter(|entry| entry.key().starts_with(&repo_path))
+            .filter(|entry| file_belongs_to_repo(&self.repo_paths, &repo_path, entry.key()))
             .map(|entry| {
                 let path = entry.key();
                 let path_str = path.to_string_lossy().to_string();
@@ -8129,6 +8616,217 @@ fn path_is_within_repo(path: &Path, repo: &Path) -> bool {
     parent_canonical.starts_with(repo_canonical)
 }
 
+fn repo_display_name(path: &Path) -> String {
+    path.file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("unknown")
+        .to_string()
+}
+
+fn repo_id_from_path(path: &Path) -> String {
+    let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    let canonical_str = canonical.to_string_lossy();
+    let mut hasher = Sha256::new();
+    hasher.update(canonical_str.as_bytes());
+    let hash = hasher.finalize();
+    let short_hash = format!(
+        "{:02x}{:02x}{:02x}{:02x}",
+        hash[0], hash[1], hash[2], hash[3]
+    );
+    format!("{}#{}", repo_display_name(path), short_hash)
+}
+
+fn search_document_id(repo_id: &str, relative_path: &str) -> String {
+    format!("{}:{}", repo_id, relative_path)
+}
+
+fn repo_walker(repo_root: &Path) -> ignore::Walk {
+    let root = repo_root.to_path_buf();
+    let has_git_file = repo_root.join(".git").is_file();
+    let mut builder = ignore::WalkBuilder::new(repo_root);
+    builder
+        .hidden(false)
+        .parents(false)
+        // A linked worktree has a `.git` file rather than a directory, but
+        // its own `.gitignore` remains authoritative.
+        .git_ignore(true)
+        .git_global(true)
+        .git_exclude(!has_git_file)
+        .require_git(false)
+        .filter_entry(move |entry| should_visit_repo_entry(&root, entry.path()));
+    builder.build()
+}
+
+fn should_visit_repo_entry(repo_root: &Path, path: &Path) -> bool {
+    !is_hidden_relative_path(repo_root, path) && !is_nested_git_root(repo_root, path)
+}
+
+fn is_hidden_relative_path(repo_root: &Path, path: &Path) -> bool {
+    let Ok(relative_path) = path.strip_prefix(repo_root) else {
+        return false;
+    };
+
+    if relative_path.as_os_str().is_empty() {
+        return false;
+    }
+
+    relative_path.components().any(|component| {
+        matches!(
+            component,
+            std::path::Component::Normal(name)
+                if name.to_string_lossy().starts_with('.')
+        )
+    })
+}
+
+fn is_nested_git_root(repo_root: &Path, path: &Path) -> bool {
+    let Ok(relative_path) = path.strip_prefix(repo_root) else {
+        return false;
+    };
+
+    if relative_path.as_os_str().is_empty() {
+        return false;
+    }
+
+    path.join(".git").exists()
+}
+
+fn owning_repo_root_for_path<'a>(repo_paths: &'a [PathBuf], path: &Path) -> Option<&'a PathBuf> {
+    repo_paths
+        .iter()
+        .filter(|repo_path| path_is_within_repo(path, repo_path))
+        .max_by_key(|repo_path| repo_path.components().count())
+}
+
+fn canonicalize_missing_path(path: &Path) -> Option<PathBuf> {
+    let mut missing_components: Vec<std::ffi::OsString> = Vec::new();
+    let mut ancestor = path;
+
+    while !ancestor.exists() {
+        let file_name = ancestor.file_name()?.to_os_string();
+        missing_components.push(file_name);
+        ancestor = ancestor.parent()?;
+    }
+
+    let mut canonical = std::fs::canonicalize(ancestor).ok()?;
+    for component in missing_components.iter().rev() {
+        canonical.push(component);
+    }
+
+    Some(canonical)
+}
+
+fn file_belongs_to_repo(repo_paths: &[PathBuf], repo_path: &Path, path: &Path) -> bool {
+    owning_repo_root_for_path(repo_paths, path).is_some_and(|owner| owner == repo_path)
+}
+
+fn file_metadata_for_path(
+    full_path: &Path,
+    cached_content: Option<&[u8]>,
+    symbols: Vec<Symbol>,
+) -> Option<crate::persist::FileMetadata> {
+    let metadata = std::fs::metadata(full_path).ok()?;
+    let modified = metadata
+        .modified()
+        .ok()
+        .and_then(|m| m.duration_since(SystemTime::UNIX_EPOCH).ok())
+        .map(|d| d.as_nanos())
+        .and_then(|n| u64::try_from(n).ok())
+        .unwrap_or(0);
+
+    let content_hash = if let Some(content) = cached_content {
+        let mut hasher = Sha256::new();
+        hasher.update(content);
+        format!("{:x}", hasher.finalize())
+    } else if let Ok(content) = std::fs::read(full_path) {
+        let mut hasher = Sha256::new();
+        hasher.update(&content);
+        format!("{:x}", hasher.finalize())
+    } else {
+        String::new()
+    };
+
+    Some(crate::persist::FileMetadata {
+        path: full_path.to_path_buf(),
+        content_hash,
+        modified_time: modified,
+        size: metadata.len(),
+        symbols,
+    })
+}
+
+fn should_index_changed_file(repo_root: &Path, file_path: &Path) -> bool {
+    let Ok(relative_path) = file_path.strip_prefix(repo_root) else {
+        return false;
+    };
+
+    if relative_path.components().any(|component| {
+        matches!(
+            component,
+            std::path::Component::Normal(name)
+                if name.to_string_lossy().starts_with('.')
+        )
+    }) {
+        return false;
+    }
+
+    let mut builder = ignore::gitignore::GitignoreBuilder::new(repo_root);
+    let git_exclude = repo_root.join(".git").join("info").join("exclude");
+    if git_exclude.is_file() {
+        if let Some(err) = builder.add(&git_exclude) {
+            warn!(
+                "Failed to load git exclude file {}: {}",
+                git_exclude.display(),
+                err
+            );
+        }
+    }
+
+    let mut dirs = Vec::new();
+    let mut current = file_path.parent();
+    while let Some(dir) = current {
+        if !dir.starts_with(repo_root) {
+            break;
+        }
+        dirs.push(dir.to_path_buf());
+        if dir == repo_root {
+            break;
+        }
+        current = dir.parent();
+    }
+    dirs.reverse();
+
+    for dir in dirs {
+        let ignore_file = dir.join(".gitignore");
+        if ignore_file.is_file() {
+            if let Some(err) = builder.add(&ignore_file) {
+                warn!(
+                    "Failed to load gitignore file {}: {}",
+                    ignore_file.display(),
+                    err
+                );
+            }
+        }
+    }
+
+    let matcher = match builder.build() {
+        Ok(matcher) => matcher,
+        Err(err) => {
+            warn!(
+                "Failed to build gitignore matcher for {}: {}",
+                repo_root.display(),
+                err
+            );
+            return true;
+        }
+    };
+
+    !matches!(
+        matcher.matched_path_or_any_parents(relative_path, false),
+        ignore::Match::Ignore(_)
+    )
+}
+
 /// Validate that a requested path is within the repository root to prevent path traversal attacks
 fn validate_path(repo_root: &Path, requested: &str) -> Result<PathBuf> {
     // Don't allow paths starting with /
@@ -8323,4 +9021,167 @@ fn get_language_from_path(path: &str) -> String {
         _ => "unknown",
     }
     .to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn test_options() -> EngineOptions {
+        EngineOptions {
+            cache_enabled: false,
+            cache_ttl_seconds: 1,
+            ..EngineOptions::default()
+        }
+    }
+
+    #[test]
+    fn repo_id_is_deterministic_for_same_path() {
+        let temp = TempDir::new().expect("failed to create temp dir");
+        let repo_path = temp.path().join("project");
+        std::fs::create_dir_all(&repo_path).expect("failed to create repo dir");
+
+        let first = repo_id_from_path(&repo_path);
+        let second = repo_id_from_path(&repo_path);
+        assert_eq!(first, second);
+        assert!(first.starts_with("project#"));
+    }
+
+    #[test]
+    fn nested_git_roots_are_skipped_but_configured_root_is_indexable() {
+        let temp = TempDir::new().expect("failed to create temp dir");
+        let repo_path = temp.path().join("project");
+        let nested_repo = repo_path.join("nested-repo");
+        let submodule_repo = repo_path.join("submodule-repo");
+        std::fs::create_dir_all(repo_path.join(".git")).expect("failed to create root git dir");
+        std::fs::create_dir_all(nested_repo.join(".git")).expect("failed to create nested git dir");
+        std::fs::create_dir_all(&submodule_repo).expect("failed to create submodule repo dir");
+        std::fs::write(
+            submodule_repo.join(".git"),
+            "gitdir: ../.git/modules/submodule-repo",
+        )
+        .expect("failed to create submodule git file");
+
+        assert!(!is_nested_git_root(&repo_path, &repo_path));
+        assert!(is_nested_git_root(&repo_path, &nested_repo));
+        assert!(is_nested_git_root(&repo_path, &submodule_repo));
+        assert!(!is_nested_git_root(&submodule_repo, &submodule_repo));
+    }
+
+    #[test]
+    fn hidden_ancestors_do_not_hide_configured_repo_root() {
+        let temp = TempDir::new().expect("failed to create temp dir");
+        let repo_path = temp.path().join(".hidden-parent").join("resources");
+        let hidden_child = repo_path.join(".cache");
+        let visible_child = repo_path.join("Base");
+
+        assert!(!is_hidden_relative_path(&repo_path, &repo_path));
+        assert!(!is_hidden_relative_path(&repo_path, &visible_child));
+        assert!(is_hidden_relative_path(&repo_path, &hidden_child));
+    }
+
+    #[test]
+    fn linked_worktree_root_still_honors_its_gitignore() {
+        let temp = TempDir::new().expect("failed to create temp dir");
+        let repo_path = temp.path().join("linked-worktree");
+        std::fs::create_dir_all(repo_path.join("dist")).expect("failed to create dist");
+        std::fs::create_dir_all(repo_path.join("src")).expect("failed to create src");
+        std::fs::write(repo_path.join(".git"), "gitdir: ../common/worktrees/test")
+            .expect("failed to create worktree git file");
+        std::fs::write(repo_path.join(".gitignore"), "dist/\n")
+            .expect("failed to create gitignore");
+        std::fs::write(repo_path.join("dist/generated.ts"), "generated")
+            .expect("failed to create ignored file");
+        std::fs::write(repo_path.join("src/index.ts"), "source")
+            .expect("failed to create source file");
+
+        let files: Vec<_> = repo_walker(&repo_path)
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_type().is_some_and(|kind| kind.is_file()))
+            .map(|entry| entry.path().to_path_buf())
+            .collect();
+
+        assert!(files.contains(&repo_path.join("src/index.ts")));
+        assert!(!files.contains(&repo_path.join("dist/generated.ts")));
+    }
+
+    #[test]
+    fn owning_repo_root_prefers_most_specific_nested_route() {
+        let temp = TempDir::new().expect("failed to create temp dir");
+        let repo_path = temp.path().join("project");
+        let resources_path = repo_path.join(".civ7").join("outputs").join("resources");
+        let file_path = resources_path.join("Base").join("example.js");
+        let repo_paths = vec![repo_path.clone(), resources_path.clone()];
+
+        assert_eq!(
+            owning_repo_root_for_path(&repo_paths, &file_path),
+            Some(&resources_path)
+        );
+        assert_eq!(
+            owning_repo_root_for_path(&repo_paths, &repo_path.join("src").join("main.ts")),
+            Some(&repo_path)
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_repo_id_rejects_ambiguous_basename() {
+        let sandbox = TempDir::new().expect("failed to create sandbox");
+        let repo1 = sandbox.path().join("a").join("project");
+        let repo2 = sandbox.path().join("b").join("project");
+        std::fs::create_dir_all(&repo1).expect("failed to create repo1");
+        std::fs::create_dir_all(&repo2).expect("failed to create repo2");
+
+        let index_path = sandbox.path().join("index");
+        std::fs::create_dir_all(&index_path).expect("failed to create index dir");
+
+        let engine = CodeIntelEngine::with_options(
+            index_path,
+            vec![repo1.clone(), repo2.clone()],
+            test_options(),
+        )
+        .await
+        .expect("engine init failed");
+
+        engine.index_repo(&repo1).await.expect("index repo1 failed");
+        engine.index_repo(&repo2).await.expect("index repo2 failed");
+
+        let err = engine
+            .resolve_repo_id("project")
+            .expect_err("expected ambiguous basename to fail");
+        assert!(err.to_string().contains("ambiguous"));
+
+        let id1 = repo_id_from_path(&repo1);
+        let id2 = repo_id_from_path(&repo2);
+        assert_eq!(
+            engine.resolve_repo_id(&id1).expect("resolve id1 failed"),
+            id1
+        );
+        assert_eq!(
+            engine.resolve_repo_id(&id2).expect("resolve id2 failed"),
+            id2
+        );
+    }
+
+    #[tokio::test]
+    async fn get_repo_path_accepts_full_path_lookup() {
+        let sandbox = TempDir::new().expect("failed to create sandbox");
+        let repo = sandbox.path().join("repo-full-path");
+        std::fs::create_dir_all(&repo).expect("failed to create repo");
+
+        let index_path = sandbox.path().join("index");
+        std::fs::create_dir_all(&index_path).expect("failed to create index dir");
+
+        let engine = CodeIntelEngine::with_options(index_path, vec![repo.clone()], test_options())
+            .await
+            .expect("engine init failed");
+        engine.index_repo(&repo).await.expect("index failed");
+
+        let resolved = engine
+            .get_repo_path(repo.to_string_lossy().as_ref())
+            .expect("path lookup failed");
+        let resolved_canonical = resolved.canonicalize().unwrap_or_else(|_| resolved.clone());
+        let expected_canonical = repo.canonicalize().unwrap_or_else(|_| repo.clone());
+        assert_eq!(resolved_canonical, expected_canonical);
+    }
 }

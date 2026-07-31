@@ -2,7 +2,9 @@
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser as ClapParser, Subcommand};
-use narsil_mcp::{config, http_server, index, lsp, mcp, neural, persist, repo, streaming};
+use narsil_mcp::{
+    config, http_server, index, lsp, mcp, mcp_http, neural, persist, repo, streaming,
+};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tracing::{info, warn, Level};
@@ -80,6 +82,10 @@ struct ServerArgs {
     #[arg(short, long, env = "NARSIL_PERSIST")]
     persist: bool,
 
+    /// Load persisted indexes but never write them
+    #[arg(long, env = "NARSIL_PERSIST_READONLY")]
+    persist_readonly: bool,
+
     /// Enable LSP integration for enhanced code intelligence (requires language servers installed)
     #[arg(long, env = "NARSIL_LSP")]
     lsp: bool,
@@ -115,6 +121,34 @@ struct ServerArgs {
     /// HTTP server port (default: 3000)
     #[arg(long, env = "NARSIL_HTTP_PORT", default_value = "3000")]
     http_port: u16,
+
+    /// Enable MCP over HTTP transport (shared daemon mode)
+    #[arg(long, env = "NARSIL_MCP_HTTP")]
+    mcp_http: bool,
+
+    /// MCP HTTP bind host
+    #[arg(long, env = "NARSIL_MCP_HTTP_HOST", default_value = "127.0.0.1")]
+    mcp_http_host: String,
+
+    /// MCP HTTP port
+    #[arg(long, env = "NARSIL_MCP_HTTP_PORT", default_value = "12006")]
+    mcp_http_port: u16,
+
+    /// MCP HTTP endpoint path
+    #[arg(long, env = "NARSIL_MCP_HTTP_PATH", default_value = "/mcp")]
+    mcp_http_path: String,
+
+    /// MCP HTTP session idle TTL in seconds
+    #[arg(
+        long,
+        env = "NARSIL_MCP_SESSION_IDLE_TTL_SECONDS",
+        default_value = "1800"
+    )]
+    mcp_session_idle_ttl_seconds: u64,
+
+    /// Maximum active MCP HTTP sessions
+    #[arg(long, env = "NARSIL_MCP_SESSION_MAX", default_value = "512")]
+    mcp_session_max: usize,
 
     /// Tool preset (minimal, balanced, full, security-focused)
     /// Overrides the preset from config file
@@ -196,8 +230,20 @@ async fn main() -> Result<()> {
     let graph_available = false;
 
     info!(
-        "Features: call_graph={}, git={}, watch={}, persist={}, lsp={}, streaming={}, remote={}, neural={}, cache={}, graph={}",
-        server_args.call_graph, server_args.git, server_args.watch, server_args.persist, server_args.lsp, server_args.streaming, server_args.remote, server_args.neural, !server_args.no_cache, graph_available
+        "Features: call_graph={}, git={}, watch={}, persist={}, persist_readonly={}, lsp={}, streaming={}, remote={}, neural={}, cache={}, graph={}, http={}, mcp_http={}",
+        server_args.call_graph,
+        server_args.git,
+        server_args.watch,
+        server_args.persist,
+        server_args.persist_readonly,
+        server_args.lsp,
+        server_args.streaming,
+        server_args.remote,
+        server_args.neural,
+        !server_args.no_cache,
+        graph_available,
+        server_args.http,
+        server_args.mcp_http
     );
 
     // Build LSP config
@@ -257,7 +303,8 @@ async fn main() -> Result<()> {
     let options = index::EngineOptions {
         git_enabled: server_args.git,
         call_graph_enabled: server_args.call_graph,
-        persist_enabled: server_args.persist,
+        persist_enabled: server_args.persist || server_args.persist_readonly,
+        persist_readonly: server_args.persist_readonly,
         watch_enabled: server_args.watch,
         remote_enabled: server_args.remote,
         streaming_config,
@@ -289,18 +336,21 @@ async fn main() -> Result<()> {
     // Start background initialization task (indexing repos, git init)
     let init_engine = Arc::clone(&engine);
     let reindex_flag = server_args.reindex;
+    let (initialization_tx, initialization_rx) = tokio::sync::oneshot::channel();
     tokio::spawn(async move {
-        if reindex_flag {
+        let result = if reindex_flag {
             info!("Re-indexing all repositories...");
-            if let Err(e) = init_engine.reindex_all().await {
-                warn!("Error during re-indexing: {}", e);
-            }
+            init_engine.reindex_all().await
         } else {
             // Complete deferred initialization
-            if let Err(e) = init_engine.complete_initialization().await {
-                warn!("Error during background initialization: {}", e);
-            }
+            init_engine.complete_initialization().await
+        };
+
+        if let Err(e) = &result {
+            warn!("Error during background initialization: {}", e);
         }
+
+        let _ = initialization_tx.send(result.is_ok());
     });
 
     // Start watch mode in background if enabled.
@@ -311,28 +361,51 @@ async fn main() -> Result<()> {
     // `_watch_shutdown_tx` here keeps it alive for the rest of `main`; the
     // tokio runtime tears the detached task down when `main` returns.
     let _watch_shutdown_tx = if server_args.watch {
-        Some(persist::spawn_watch_mode(Arc::clone(&engine)))
+        Some(persist::spawn_watch_mode(
+            Arc::clone(&engine),
+            initialization_rx,
+        ))
     } else {
         None
     };
 
-    // Start HTTP server in background if enabled (for visualization frontend)
-    // The MCP server still runs on stdio for editor communication
-    if server_args.http {
-        info!("Starting HTTP server on port {}", server_args.http_port);
-        let http_engine = Arc::clone(&engine);
-        let http_port = server_args.http_port;
-        tokio::spawn(async move {
-            let http_server = http_server::HttpServer::new(http_engine, http_port);
-            if let Err(e) = http_server.run().await {
-                warn!("HTTP server error: {}", e);
-            }
-        });
-    }
+    // Shared-daemon mode must not also run stdio: stdin would keep the daemon
+    // coupled to whichever process happened to launch it.
+    if server_args.mcp_http {
+        let mcp_http_server = mcp_http::McpHttpServer::new(
+            Arc::clone(&engine),
+            server_args.mcp_http_host,
+            server_args.mcp_http_port,
+            server_args.mcp_http_path,
+            server_args.preset.clone(),
+            mcp_http::McpHttpSessionConfig::new(
+                server_args.mcp_session_idle_ttl_seconds,
+                server_args.mcp_session_max,
+            ),
+        );
 
-    // Always start the MCP server on stdio (for editor communication)
-    let server = mcp::McpServer::from_arc(engine, server_args.preset);
-    server.run().await?;
+        if server_args.http {
+            let vis_server =
+                http_server::HttpServer::new(Arc::clone(&engine), server_args.http_port);
+            tokio::try_join!(vis_server.run(), mcp_http_server.run())?;
+        } else {
+            mcp_http_server.run().await?;
+        }
+    } else {
+        if server_args.http {
+            let http_engine = Arc::clone(&engine);
+            let http_port = server_args.http_port;
+            tokio::spawn(async move {
+                let http_server = http_server::HttpServer::new(http_engine, http_port);
+                if let Err(e) = http_server.run().await {
+                    warn!("HTTP server error: {}", e);
+                }
+            });
+        }
+
+        let server = mcp::McpServer::from_arc(engine, server_args.preset);
+        server.run().await?;
+    }
 
     Ok(())
 }
@@ -524,6 +597,7 @@ mod tests {
             "NARSIL_GIT",
             "NARSIL_DISCOVER",
             "NARSIL_PERSIST",
+            "NARSIL_PERSIST_READONLY",
             "NARSIL_LSP",
             "NARSIL_STREAMING",
             "NARSIL_REMOTE",
@@ -533,6 +607,12 @@ mod tests {
             "NARSIL_NEURAL_DIMENSION",
             "NARSIL_HTTP",
             "NARSIL_HTTP_PORT",
+            "NARSIL_MCP_HTTP",
+            "NARSIL_MCP_HTTP_HOST",
+            "NARSIL_MCP_HTTP_PORT",
+            "NARSIL_MCP_HTTP_PATH",
+            "NARSIL_MCP_SESSION_IDLE_TTL_SECONDS",
+            "NARSIL_MCP_SESSION_MAX",
             "NARSIL_PRESET",
             "NARSIL_NO_CACHE",
             "NARSIL_CACHE_TTL",
@@ -608,6 +688,28 @@ mod tests {
         });
         std::env::remove_var("NARSIL_HTTP_PORT");
         assert_eq!(args.server.http_port, 4444);
+    }
+
+    #[test]
+    fn shared_daemon_settings_are_settable_via_env() {
+        let args = parse_with_env(|| {
+            std::env::set_var("NARSIL_PERSIST_READONLY", "true");
+            std::env::set_var("NARSIL_MCP_HTTP", "true");
+            std::env::set_var("NARSIL_MCP_HTTP_PORT", "13006");
+            std::env::set_var("NARSIL_MCP_SESSION_MAX", "64");
+        });
+        for var in [
+            "NARSIL_PERSIST_READONLY",
+            "NARSIL_MCP_HTTP",
+            "NARSIL_MCP_HTTP_PORT",
+            "NARSIL_MCP_SESSION_MAX",
+        ] {
+            std::env::remove_var(var);
+        }
+        assert!(args.server.persist_readonly);
+        assert!(args.server.mcp_http);
+        assert_eq!(args.server.mcp_http_port, 13006);
+        assert_eq!(args.server.mcp_session_max, 64);
     }
 
     #[test]

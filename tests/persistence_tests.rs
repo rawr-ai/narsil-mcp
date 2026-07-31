@@ -406,6 +406,422 @@ async fn test_async_watcher_creation() -> Result<()> {
 }
 
 #[tokio::test]
+async fn test_process_file_changes_skips_gitignored_source_files() -> Result<()> {
+    use narsil_mcp::index::{CodeIntelEngine, EngineOptions};
+    use narsil_mcp::persist::{ChangeType, FileChange, IndexStore};
+
+    let repo = TestRepo::new()?;
+    repo.add_rust_file("src/lib.rs", "pub fn allowed_symbol() {}")?;
+    std::fs::write(repo.path().join(".gitignore"), "node_modules/\n")?;
+
+    let ignored_path = repo.path().join("node_modules/pkg/index.rs");
+    if let Some(parent) = ignored_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(&ignored_path, "pub fn ignored_symbol() {}")?;
+
+    let index_dir = TempDir::new()?;
+    let repo_root = std::fs::canonicalize(repo.path())?;
+    let options = EngineOptions {
+        git_enabled: false,
+        call_graph_enabled: false,
+        persist_enabled: true,
+        watch_enabled: true,
+        streaming_config: StreamingConfig::default(),
+        lsp_config: LspConfig::default(),
+        neural_config: NeuralConfig::default(),
+        ..Default::default()
+    };
+
+    let engine = CodeIntelEngine::with_options(
+        index_dir.path().to_path_buf(),
+        vec![repo_root.clone()],
+        options,
+    )
+    .await?;
+    engine.complete_initialization().await?;
+
+    let store = IndexStore::new(index_dir.path().to_path_buf())?;
+    let index_path = store.index_path(&repo_root);
+    let index_before = std::fs::read(&index_path)?;
+
+    let changed = engine
+        .process_file_changes(&[FileChange {
+            path: ignored_path.clone(),
+            change_type: ChangeType::Created,
+        }])
+        .await?;
+    assert_eq!(changed, 0);
+    assert_eq!(std::fs::read(&index_path)?, index_before);
+
+    std::fs::remove_file(&ignored_path)?;
+    let deleted = engine
+        .process_file_changes(&[FileChange {
+            path: ignored_path,
+            change_type: ChangeType::Deleted,
+        }])
+        .await?;
+    assert_eq!(deleted, 0);
+    assert_eq!(std::fs::read(&index_path)?, index_before);
+
+    let repo_name = repo.path().file_name().unwrap().to_string_lossy();
+    let ignored = engine
+        .find_symbols(
+            &repo_name,
+            Some("function"),
+            Some("ignored_symbol"),
+            None,
+            None,
+        )
+        .await?;
+    assert!(ignored.contains("Found 0 symbols"));
+
+    let allowed = engine
+        .find_symbols(
+            &repo_name,
+            Some("function"),
+            Some("allowed_symbol"),
+            None,
+            None,
+        )
+        .await?;
+    assert!(allowed.contains("allowed_symbol"));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_process_file_changes_skips_unchanged_content_and_persistence() -> Result<()> {
+    use narsil_mcp::index::{CodeIntelEngine, EngineOptions};
+    use narsil_mcp::persist::{ChangeType, FileChange, IndexStore};
+
+    let repo = TestRepo::new()?;
+    repo.add_rust_file("src/lib.rs", "pub fn unchanged_symbol() {}")?;
+    let repo_root = std::fs::canonicalize(repo.path())?;
+    let index_dir = TempDir::new()?;
+    let engine = CodeIntelEngine::with_options(
+        index_dir.path().to_path_buf(),
+        vec![repo_root.clone()],
+        EngineOptions {
+            persist_enabled: true,
+            watch_enabled: true,
+            ..Default::default()
+        },
+    )
+    .await?;
+    engine.complete_initialization().await?;
+
+    let store = IndexStore::new(index_dir.path().to_path_buf())?;
+    let index_path = store.index_path(&repo_root);
+    let index_before = std::fs::read(&index_path)?;
+
+    let changed = engine
+        .process_file_changes(&[FileChange {
+            path: repo_root.join("src/lib.rs"),
+            change_type: ChangeType::Modified,
+        }])
+        .await?;
+
+    assert_eq!(changed, 0);
+    assert_eq!(std::fs::read(index_path)?, index_before);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_process_file_changes_removes_file_that_becomes_ignored() -> Result<()> {
+    use narsil_mcp::index::{CodeIntelEngine, EngineOptions};
+    use narsil_mcp::persist::{ChangeType, FileChange};
+
+    let repo = TestRepo::new()?;
+    repo.add_rust_file("generated/index.rs", "pub fn formerly_indexed_symbol() {}")?;
+
+    let index_dir = TempDir::new()?;
+    let options = EngineOptions {
+        git_enabled: false,
+        call_graph_enabled: false,
+        persist_enabled: false,
+        watch_enabled: true,
+        cache_enabled: false,
+        streaming_config: StreamingConfig::default(),
+        lsp_config: LspConfig::default(),
+        neural_config: NeuralConfig::default(),
+        ..Default::default()
+    };
+
+    let engine = CodeIntelEngine::with_options(
+        index_dir.path().to_path_buf(),
+        vec![repo.path().to_path_buf()],
+        options,
+    )
+    .await?;
+    engine.complete_initialization().await?;
+
+    let repo_name = repo.path().file_name().unwrap().to_string_lossy();
+    let before = engine
+        .find_symbols(
+            &repo_name,
+            Some("function"),
+            Some("formerly_indexed_symbol"),
+            None,
+            None,
+        )
+        .await?;
+    assert!(before.contains("formerly_indexed_symbol"));
+
+    std::fs::write(repo.path().join(".gitignore"), "generated/\n")?;
+    let changed = engine
+        .process_file_changes(&[FileChange {
+            path: repo.path().join("generated/index.rs"),
+            change_type: ChangeType::Modified,
+        }])
+        .await?;
+    assert_eq!(changed, 1);
+
+    let after = engine
+        .find_symbols(
+            &repo_name,
+            Some("function"),
+            Some("formerly_indexed_symbol"),
+            None,
+            None,
+        )
+        .await?;
+    assert!(after.contains("Found 0 symbols"));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_process_file_changes_replaces_search_document_on_modify() -> Result<()> {
+    use narsil_mcp::index::{CodeIntelEngine, EngineOptions};
+    use narsil_mcp::persist::{ChangeType, FileChange};
+
+    let repo = TestRepo::new()?;
+    repo.add_rust_file("src/lib.rs", "pub fn stalelexicalterm() {}")?;
+
+    let index_dir = TempDir::new()?;
+    let options = EngineOptions {
+        git_enabled: false,
+        call_graph_enabled: false,
+        persist_enabled: false,
+        watch_enabled: true,
+        cache_enabled: false,
+        streaming_config: StreamingConfig::default(),
+        lsp_config: LspConfig::default(),
+        neural_config: NeuralConfig::default(),
+        ..Default::default()
+    };
+
+    let engine = CodeIntelEngine::with_options(
+        index_dir.path().to_path_buf(),
+        vec![repo.path().to_path_buf()],
+        options,
+    )
+    .await?;
+    engine.complete_initialization().await?;
+
+    let repo_name = repo.path().file_name().unwrap().to_string_lossy();
+    let before = engine
+        .semantic_search(Some(&repo_name), "stalelexicalterm", 10, None, None)
+        .await?;
+    assert!(before.contains("Found 1 results"));
+
+    repo.add_rust_file("src/lib.rs", "pub fn freshlexicalterm() {}")?;
+    let changed_path = repo.path().join("src/lib.rs");
+    let changed = engine
+        .process_file_changes(&[FileChange {
+            path: changed_path,
+            change_type: ChangeType::Modified,
+        }])
+        .await?;
+    assert_eq!(changed, 1);
+
+    let stale = engine
+        .semantic_search(Some(&repo_name), "stalelexicalterm", 10, None, None)
+        .await?;
+    assert!(stale.contains("Found 0 results"));
+
+    let fresh = engine
+        .semantic_search(Some(&repo_name), "freshlexicalterm", 10, None, None)
+        .await?;
+    assert!(fresh.contains("Found 1 results"));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_process_file_changes_removes_search_document_on_delete() -> Result<()> {
+    use narsil_mcp::index::{CodeIntelEngine, EngineOptions};
+    use narsil_mcp::persist::{ChangeType, FileChange};
+
+    let repo = TestRepo::new()?;
+    repo.add_rust_file("src/lib.rs", "pub fn deletedlexicalterm() {}")?;
+
+    let index_dir = TempDir::new()?;
+    let options = EngineOptions {
+        git_enabled: false,
+        call_graph_enabled: false,
+        persist_enabled: false,
+        watch_enabled: true,
+        cache_enabled: false,
+        streaming_config: StreamingConfig::default(),
+        lsp_config: LspConfig::default(),
+        neural_config: NeuralConfig::default(),
+        ..Default::default()
+    };
+
+    let engine = CodeIntelEngine::with_options(
+        index_dir.path().to_path_buf(),
+        vec![repo.path().to_path_buf()],
+        options,
+    )
+    .await?;
+    engine.complete_initialization().await?;
+
+    let repo_name = repo.path().file_name().unwrap().to_string_lossy();
+    let before = engine
+        .semantic_search(Some(&repo_name), "deletedlexicalterm", 10, None, None)
+        .await?;
+    assert!(before.contains("Found 1 results"));
+
+    let deleted_path = repo.path().join("src/lib.rs");
+    std::fs::remove_file(&deleted_path)?;
+    let changed = engine
+        .process_file_changes(&[FileChange {
+            path: deleted_path,
+            change_type: ChangeType::Deleted,
+        }])
+        .await?;
+    assert_eq!(changed, 1);
+
+    let after = engine
+        .semantic_search(Some(&repo_name), "deletedlexicalterm", 10, None, None)
+        .await?;
+    assert!(after.contains("Found 0 results"));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_process_file_changes_keeps_same_relative_path_in_other_repo() -> Result<()> {
+    use narsil_mcp::index::{CodeIntelEngine, EngineOptions};
+    use narsil_mcp::persist::{ChangeType, FileChange};
+
+    let repo_a = TestRepo::new()?;
+    let repo_b = TestRepo::new()?;
+    repo_a.add_rust_file("src/lib.rs", "pub fn repoaoriginalterm() {}")?;
+    repo_b.add_rust_file("src/lib.rs", "pub fn repobsurvivorterm() {}")?;
+
+    let index_dir = TempDir::new()?;
+    let options = EngineOptions {
+        git_enabled: false,
+        call_graph_enabled: false,
+        persist_enabled: false,
+        watch_enabled: true,
+        cache_enabled: false,
+        streaming_config: StreamingConfig::default(),
+        lsp_config: LspConfig::default(),
+        neural_config: NeuralConfig::default(),
+        ..Default::default()
+    };
+
+    let engine = CodeIntelEngine::with_options(
+        index_dir.path().to_path_buf(),
+        vec![repo_a.path().to_path_buf(), repo_b.path().to_path_buf()],
+        options,
+    )
+    .await?;
+    engine.complete_initialization().await?;
+
+    let before = engine
+        .semantic_search(None, "repobsurvivorterm", 10, None, None)
+        .await?;
+    assert!(before.contains("Found 1 results"));
+
+    repo_a.add_rust_file("src/lib.rs", "pub fn repoareplacedterm() {}")?;
+    let changed = engine
+        .process_file_changes(&[FileChange {
+            path: repo_a.path().join("src/lib.rs"),
+            change_type: ChangeType::Modified,
+        }])
+        .await?;
+    assert_eq!(changed, 1);
+
+    let stale_a = engine
+        .semantic_search(None, "repoaoriginalterm", 10, None, None)
+        .await?;
+    assert!(stale_a.contains("Found 0 results"));
+
+    let fresh_a = engine
+        .semantic_search(None, "repoareplacedterm", 10, None, None)
+        .await?;
+    assert!(fresh_a.contains("Found 1 results"));
+
+    let still_b = engine
+        .semantic_search(None, "repobsurvivorterm", 10, None, None)
+        .await?;
+    assert!(still_b.contains("Found 1 results"));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_process_file_changes_persists_only_changed_repo() -> Result<()> {
+    use narsil_mcp::index::{CodeIntelEngine, EngineOptions};
+    use narsil_mcp::persist::{ChangeType, FileChange, IndexStore};
+
+    let repo_a = TestRepo::new()?;
+    let repo_b = TestRepo::new()?;
+    repo_a.add_rust_file("src/lib.rs", "pub fn repo_a_before() {}")?;
+    repo_b.add_rust_file("src/lib.rs", "pub fn repo_b_unchanged() {}")?;
+
+    let index_dir = TempDir::new()?;
+    let repo_a_root = std::fs::canonicalize(repo_a.path())?;
+    let repo_b_root = std::fs::canonicalize(repo_b.path())?;
+    let options = EngineOptions {
+        git_enabled: false,
+        call_graph_enabled: false,
+        persist_enabled: true,
+        watch_enabled: true,
+        cache_enabled: false,
+        streaming_config: StreamingConfig::default(),
+        lsp_config: LspConfig::default(),
+        neural_config: NeuralConfig::default(),
+        ..Default::default()
+    };
+
+    let engine = CodeIntelEngine::with_options(
+        index_dir.path().to_path_buf(),
+        vec![repo_a_root.clone(), repo_b_root.clone()],
+        options,
+    )
+    .await?;
+    engine.complete_initialization().await?;
+
+    let store = IndexStore::new(index_dir.path().to_path_buf())?;
+    let repo_a_index = store.index_path(&repo_a_root);
+    let repo_b_index = store.index_path(&repo_b_root);
+    let repo_a_before = std::fs::read(&repo_a_index)?;
+    let repo_b_before = std::fs::read(&repo_b_index)?;
+
+    std::thread::sleep(std::time::Duration::from_secs(1));
+    repo_a.add_rust_file("src/lib.rs", "pub fn repo_a_after() {}")?;
+    let changed = engine
+        .process_file_changes(&[FileChange {
+            path: repo_a.path().join("src/lib.rs"),
+            change_type: ChangeType::Modified,
+        }])
+        .await?;
+
+    assert_eq!(changed, 1);
+    assert_ne!(std::fs::read(repo_a_index)?, repo_a_before);
+    assert_eq!(std::fs::read(repo_b_index)?, repo_b_before);
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn test_async_watcher_disabled_when_watch_disabled() -> Result<()> {
     use narsil_mcp::index::{CodeIntelEngine, EngineOptions};
 
@@ -653,7 +1069,9 @@ async fn test_spawn_watch_mode_keeps_running_when_sender_alive() -> Result<()> {
 
     // Mirror the production wiring from main.rs: hold the Sender so the
     // watcher keeps running.
-    let _shutdown_tx = persist::spawn_watch_mode(Arc::clone(&engine));
+    let (initialization_tx, initialization_rx) = tokio::sync::oneshot::channel();
+    initialization_tx.send(true).unwrap();
+    let _shutdown_tx = persist::spawn_watch_mode(Arc::clone(&engine), initialization_rx);
 
     // Allow the watcher to initialise.
     tokio::time::sleep(Duration::from_millis(300)).await;
@@ -707,9 +1125,10 @@ async fn test_run_watch_mode_exits_when_sender_dropped() -> Result<()> {
     );
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel(1);
+    let (_initialization_tx, initialization_rx) = tokio::sync::oneshot::channel();
     let watch_engine = Arc::clone(&engine);
     let handle = tokio::spawn(async move {
-        persist::run_watch_mode(watch_engine, shutdown_rx).await;
+        persist::run_watch_mode(watch_engine, shutdown_rx, initialization_rx).await;
     });
 
     // Drop the only Sender — the function should observe Closed and exit.

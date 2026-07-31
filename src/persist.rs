@@ -75,8 +75,17 @@ impl PersistedIndex {
     pub fn save(&self, path: &Path) -> Result<()> {
         let data = postcard::to_stdvec(self).context("Failed to serialize index")?;
 
-        // Write to temp file then rename for atomicity
-        let temp_path = path.with_extension("tmp");
+        // Write to a unique temp file then rename for atomicity.
+        // Using a fixed temp path is unsafe if multiple processes share the same index directory.
+        let suffix = {
+            let pid = std::process::id();
+            let ts = SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos();
+            format!("tmp.{}.{}", pid, ts)
+        };
+        let temp_path = path.with_extension(suffix);
         std::fs::write(&temp_path, &data).context("Failed to write temp index")?;
         std::fs::rename(&temp_path, path).context("Failed to rename index file")?;
 
@@ -89,7 +98,8 @@ impl PersistedIndex {
         let modified = metadata
             .modified()?
             .duration_since(SystemTime::UNIX_EPOCH)?
-            .as_secs();
+            .as_nanos();
+        let modified: u64 = modified.try_into().unwrap_or(u64::MAX);
         let size = metadata.len();
 
         if let Some(cached) = self.files.get(path) {
@@ -119,7 +129,9 @@ impl PersistedIndex {
                 modified_time: metadata
                     .modified()?
                     .duration_since(SystemTime::UNIX_EPOCH)?
-                    .as_secs(),
+                    .as_nanos()
+                    .try_into()
+                    .unwrap_or(u64::MAX),
                 size: metadata.len(),
                 symbols,
             },
@@ -285,7 +297,8 @@ impl FileWatcher {
                         _ => continue,
                     };
 
-                    changes.extend(source_changes_for_path(&path, change_type));
+                    let repo_root = owning_watched_root(&self.watched_paths, &path);
+                    changes.extend(source_changes_for_path(&path, change_type, repo_root));
                 }
             }
         }
@@ -310,7 +323,8 @@ impl FileWatcher {
                     _ => continue,
                 };
 
-                changes.extend(source_changes_for_path(&path, change_type));
+                let repo_root = owning_watched_root(&self.watched_paths, &path);
+                changes.extend(source_changes_for_path(&path, change_type, repo_root));
             }
         }
 
@@ -325,7 +339,7 @@ impl FileWatcher {
 #[cfg(feature = "native")]
 pub struct AsyncFileWatcher {
     _watcher: PollWatcher,
-    watched_paths: Vec<PathBuf>,
+    watched_paths: Arc<RwLock<Vec<PathBuf>>>,
 }
 
 #[cfg(feature = "native")]
@@ -333,6 +347,8 @@ impl AsyncFileWatcher {
     /// Create a new async file watcher and return a channel receiver for events
     pub fn new() -> Result<(Self, mpsc::Receiver<Vec<FileChange>>)> {
         let (tx, rx) = mpsc::channel(100);
+        let watched_paths = Arc::new(RwLock::new(Vec::<PathBuf>::new()));
+        let event_roots = Arc::clone(&watched_paths);
 
         // Create a channel for the notify watcher
         let (notify_tx, mut notify_rx) = mpsc::unbounded_channel();
@@ -364,7 +380,13 @@ impl AsyncFileWatcher {
                                     _ => continue,
                                 };
 
-                                for change in source_changes_for_path(&path, change_type.clone()) {
+                                let roots = event_roots.read();
+                                let repo_root = owning_watched_root(&roots, &path);
+                                for change in source_changes_for_path(
+                                    &path,
+                                    change_type.clone(),
+                                    repo_root,
+                                ) {
                                     // Add to debounce buffer (overwrites previous events for same file)
                                     debounce_buffer.insert(change.path.clone(), change);
                                 }
@@ -388,7 +410,7 @@ impl AsyncFileWatcher {
         Ok((
             Self {
                 _watcher: watcher,
-                watched_paths: Vec::new(),
+                watched_paths,
             },
             rx,
         ))
@@ -397,7 +419,8 @@ impl AsyncFileWatcher {
     /// Watch a directory for changes
     pub fn watch(&mut self, path: &Path) -> Result<()> {
         self._watcher.watch(path, RecursiveMode::Recursive)?;
-        self.watched_paths.push(path.to_path_buf());
+        let normalized = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        self.watched_paths.write().push(normalized);
         info!("Async watching for changes: {:?}", path);
         Ok(())
     }
@@ -405,13 +428,14 @@ impl AsyncFileWatcher {
     /// Stop watching a directory
     pub fn unwatch(&mut self, path: &Path) -> Result<()> {
         self._watcher.unwatch(path)?;
-        self.watched_paths.retain(|p| p != path);
+        let normalized = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        self.watched_paths.write().retain(|p| p != &normalized);
         Ok(())
     }
 
     /// Get the list of watched paths
-    pub fn watched_paths(&self) -> &[PathBuf] {
-        &self.watched_paths
+    pub fn watched_paths(&self) -> Vec<PathBuf> {
+        self.watched_paths.read().clone()
     }
 }
 
@@ -448,7 +472,15 @@ fn is_source_file(path: &Path) -> bool {
 /// can report a directory as modified instead of the exact file. When that
 /// happens, scan the reported directory for source files so watch mode does
 /// not silently miss the change.
-fn source_changes_for_path(path: &Path, change_type: ChangeType) -> Vec<FileChange> {
+fn source_changes_for_path(
+    path: &Path,
+    change_type: ChangeType,
+    repo_root: Option<&Path>,
+) -> Vec<FileChange> {
+    if repo_root.is_some_and(|root| path_is_ignored(root, path)) {
+        return Vec::new();
+    }
+
     if is_source_file(path) {
         return vec![FileChange {
             path: path.to_path_buf(),
@@ -465,20 +497,81 @@ fn source_changes_for_path(path: &Path, change_type: ChangeType) -> Vec<FileChan
     changes
 }
 
-fn collect_source_files(path: &Path, change_type: ChangeType, changes: &mut Vec<FileChange>) {
-    let Ok(entries) = std::fs::read_dir(path) else {
-        return;
-    };
+fn owning_watched_root<'a>(roots: &'a [PathBuf], path: &Path) -> Option<&'a Path> {
+    roots
+        .iter()
+        .filter(|root| path.starts_with(root))
+        .max_by_key(|root| root.components().count())
+        .map(PathBuf::as_path)
+}
 
-    for entry in entries.flatten() {
+fn path_is_ignored(repo_root: &Path, path: &Path) -> bool {
+    let Ok(relative_path) = path.strip_prefix(repo_root) else {
+        return false;
+    };
+    if relative_path.as_os_str().is_empty() {
+        return false;
+    }
+
+    let mut builder = ignore::gitignore::GitignoreBuilder::new(repo_root);
+    let git_exclude = repo_root.join(".git").join("info").join("exclude");
+    if git_exclude.is_file() {
+        let _ = builder.add(git_exclude);
+    }
+
+    let mut ancestors = Vec::new();
+    let mut current = if path.is_dir() {
+        Some(path)
+    } else {
+        path.parent()
+    };
+    while let Some(dir) = current {
+        if !dir.starts_with(repo_root) {
+            break;
+        }
+        ancestors.push(dir);
+        if dir == repo_root {
+            break;
+        }
+        current = dir.parent();
+    }
+    ancestors.reverse();
+
+    for dir in ancestors {
+        let ignore_file = dir.join(".gitignore");
+        if ignore_file.is_file() {
+            let _ = builder.add(ignore_file);
+        }
+    }
+
+    builder.build().is_ok_and(|matcher| {
+        matches!(
+            matcher.matched_path_or_any_parents(relative_path, path.is_dir()),
+            ignore::Match::Ignore(_)
+        )
+    })
+}
+
+fn collect_source_files(path: &Path, change_type: ChangeType, changes: &mut Vec<FileChange>) {
+    let mut builder = ignore::WalkBuilder::new(path);
+    builder
+        .hidden(true)
+        .parents(true)
+        .git_ignore(true)
+        .git_global(true)
+        .git_exclude(true)
+        .require_git(false);
+
+    for entry in builder.build().flatten() {
         let entry_path = entry.path();
-        if is_source_file(&entry_path) {
+        if entry_path != path
+            && entry.file_type().is_some_and(|kind| kind.is_file())
+            && is_source_file(entry_path)
+        {
             changes.push(FileChange {
-                path: entry_path,
+                path: entry_path.to_path_buf(),
                 change_type: change_type.clone(),
             });
-        } else if entry_path.is_dir() {
-            collect_source_files(&entry_path, change_type.clone(), changes);
         }
     }
 }
@@ -600,6 +693,7 @@ impl IncrementalIndexer {
 pub async fn run_watch_mode(
     engine: Arc<crate::index::CodeIntelEngine>,
     mut shutdown: tokio::sync::broadcast::Receiver<()>,
+    initialization: tokio::sync::oneshot::Receiver<bool>,
 ) {
     info!("Starting async watch mode background task");
 
@@ -611,12 +705,29 @@ pub async fn run_watch_mode(
         }
     };
 
+    info!("Watch mode waiting for background initialization");
+    let Some(pending_changes) =
+        wait_for_initialization(initialization, &mut shutdown, &mut rx).await
+    else {
+        warn!("Watch mode stopped before background initialization completed");
+        return;
+    };
+    info!("Background initialization complete; processing watch events");
+
+    if !pending_changes.is_empty() {
+        match engine.process_file_changes(&pending_changes).await {
+            Ok(count) if count > 0 => info!("Re-indexed {} file(s)", count),
+            Ok(_) => {}
+            Err(e) => warn!("Error processing file changes: {}", e),
+        }
+    }
+
     loop {
         tokio::select! {
             // Receive batched file change events
             Some(changes) = rx.recv() => {
                 if !changes.is_empty() {
-                    info!("Detected {} file change(s)", changes.len());
+                    debug!("Detected {} candidate file change(s)", changes.len());
                     match engine.process_file_changes(&changes).await {
                         Ok(count) => {
                             if count > 0 {
@@ -651,12 +762,38 @@ pub async fn run_watch_mode(
               dropping it immediately exits the watcher (issue #26)"]
 pub fn spawn_watch_mode(
     engine: Arc<crate::index::CodeIntelEngine>,
+    initialization: tokio::sync::oneshot::Receiver<bool>,
 ) -> tokio::sync::broadcast::Sender<()> {
     let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel(1);
     tokio::spawn(async move {
-        run_watch_mode(engine, shutdown_rx).await;
+        run_watch_mode(engine, shutdown_rx, initialization).await;
     });
     shutdown_tx
+}
+
+async fn wait_for_initialization(
+    mut initialization: tokio::sync::oneshot::Receiver<bool>,
+    shutdown: &mut tokio::sync::broadcast::Receiver<()>,
+    changes: &mut mpsc::Receiver<Vec<FileChange>>,
+) -> Option<Vec<FileChange>> {
+    let mut pending = HashMap::<PathBuf, FileChange>::new();
+
+    loop {
+        tokio::select! {
+            result = &mut initialization => {
+                if !result.unwrap_or(false) {
+                    return None;
+                }
+                return Some(pending.into_values().collect());
+            }
+            Some(batch) = changes.recv() => {
+                for change in batch {
+                    pending.insert(change.path.clone(), change);
+                }
+            }
+            _ = shutdown.recv() => return None,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -686,6 +823,57 @@ mod tests {
         assert!(is_source_file(Path::new("src/index.ts")));
         assert!(!is_source_file(Path::new("README.md")));
         assert!(!is_source_file(Path::new("data.json")));
+    }
+
+    #[test]
+    fn directory_changes_respect_parent_gitignore_rules() {
+        let repo = tempdir().unwrap();
+        std::fs::write(repo.path().join(".gitignore"), "dist/\n").unwrap();
+        let dist = repo.path().join("dist");
+        let src = repo.path().join("src");
+        std::fs::create_dir_all(&dist).unwrap();
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(dist.join("ignored.ts"), "export const ignored = true;").unwrap();
+        std::fs::write(src.join("included.ts"), "export const included = true;").unwrap();
+
+        assert!(source_changes_for_path(&dist, ChangeType::Modified, Some(repo.path())).is_empty());
+        let changes = source_changes_for_path(repo.path(), ChangeType::Modified, Some(repo.path()));
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].path, src.join("included.ts"));
+    }
+
+    #[tokio::test]
+    async fn initialization_wait_drains_and_coalesces_pending_changes() {
+        let (initialization_tx, initialization_rx) = tokio::sync::oneshot::channel();
+        let (_shutdown_tx, mut shutdown_rx) = tokio::sync::broadcast::channel(1);
+        let (changes_tx, mut changes_rx) = mpsc::channel(4);
+
+        let wait = tokio::spawn(async move {
+            wait_for_initialization(initialization_rx, &mut shutdown_rx, &mut changes_rx).await
+        });
+
+        let path = PathBuf::from("src/lib.rs");
+        changes_tx
+            .send(vec![FileChange {
+                path: path.clone(),
+                change_type: ChangeType::Modified,
+            }])
+            .await
+            .unwrap();
+        changes_tx
+            .send(vec![FileChange {
+                path: path.clone(),
+                change_type: ChangeType::Deleted,
+            }])
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        initialization_tx.send(true).unwrap();
+
+        let pending = wait.await.unwrap().unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].path, path);
+        assert_eq!(pending[0].change_type, ChangeType::Deleted);
     }
 
     #[test]

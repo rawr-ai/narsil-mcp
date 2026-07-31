@@ -177,55 +177,55 @@ impl McpServer {
 
             debug!("Received: {}", trimmed);
 
-            let response = match serde_json::from_str::<JsonRpcRequest>(trimmed) {
-                Ok(request) => {
-                    // Check if this is a notification (no id field means no response expected)
-                    // JSON-RPC 2.0: "The Server MUST NOT reply to a Notification"
-                    if request.id.is_none() {
-                        // This is a notification - handle it but don't respond
-                        debug!("Handling notification: {}", request.method);
-                        let _ = self.handle_request(request).await;
-                        continue;
-                    }
-                    self.handle_request(request).await
-                }
-                Err(e) => {
-                    // Parse error - try to extract ID from raw JSON for error response
-                    // If we can't get an ID, log the error but don't respond (avoids id:null issues)
-                    if let Ok(raw) = serde_json::from_str::<Value>(trimmed) {
-                        if let Some(id) = raw.get("id").cloned() {
-                            // We have an ID, we can respond with an error
-                            if !id.is_null() {
-                                JsonRpcResponse::error(
-                                    Some(id),
-                                    -32700,
-                                    &format!("Parse error: {}", e),
-                                )
-                            } else {
-                                // id is null - don't respond to avoid ZodError
-                                debug!("Parse error with null id, not responding: {}", e);
-                                continue;
-                            }
-                        } else {
-                            // No ID field - this might be a malformed notification, don't respond
-                            debug!("Parse error without id field, not responding: {}", e);
-                            continue;
-                        }
-                    } else {
-                        // Complete parse failure - can't respond without an ID
-                        debug!("Complete parse error, not responding: {}", e);
-                        continue;
-                    }
-                }
-            };
-
-            let response_str = serde_json::to_string(&response)? + "\n";
-            debug!("Sending: {}", response_str.trim());
-            stdout.write_all(response_str.as_bytes()).await?;
-            stdout.flush().await?;
+            if let Some(response) = self.handle_jsonrpc(trimmed).await? {
+                let response_str = serde_json::to_string(&response)? + "\n";
+                debug!("Sending: {}", response_str.trim());
+                stdout.write_all(response_str.as_bytes()).await?;
+                stdout.flush().await?;
+            }
         }
 
         Ok(())
+    }
+
+    /// Handle a single JSON-RPC message body and return an optional JSON response.
+    ///
+    /// Returns:
+    /// - `Ok(Some(response))` for standard request/response messages
+    /// - `Ok(None)` for notifications or invalid messages where no response should be emitted
+    pub async fn handle_jsonrpc(&self, raw: &str) -> Result<Option<Value>> {
+        let response = match serde_json::from_str::<JsonRpcRequest>(raw) {
+            Ok(request) => {
+                // JSON-RPC 2.0 notifications do not get responses.
+                if request.id.is_none() {
+                    debug!("Handling notification: {}", request.method);
+                    let _ = self.handle_request(request).await;
+                    return Ok(None);
+                }
+                self.handle_request(request).await
+            }
+            Err(e) => {
+                // Parse error - only respond when we can extract a non-null ID.
+                if let Ok(parsed) = serde_json::from_str::<Value>(raw) {
+                    if let Some(id) = parsed.get("id").cloned() {
+                        if !id.is_null() {
+                            JsonRpcResponse::error(Some(id), -32700, &format!("Parse error: {}", e))
+                        } else {
+                            debug!("Parse error with null id, not responding: {}", e);
+                            return Ok(None);
+                        }
+                    } else {
+                        debug!("Parse error without id field, not responding: {}", e);
+                        return Ok(None);
+                    }
+                } else {
+                    debug!("Complete parse error, not responding: {}", e);
+                    return Ok(None);
+                }
+            }
+        };
+
+        Ok(Some(serde_json::to_value(response)?))
     }
 
     async fn handle_request(&self, request: JsonRpcRequest) -> JsonRpcResponse {
