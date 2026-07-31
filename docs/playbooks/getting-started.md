@@ -100,6 +100,9 @@ You should see your project listed. If not, check:
 - The server is running (check logs)
 - You restarted the AI tool after config changes
 
+Use the `repo_id` returned by `list_repos` for repo-scoped tool calls.
+Format: `<basename>#<short_hash>` (for example: `my-api#8f42c1ab`).
+
 ## 4. Try Your First Queries
 
 Now ask questions about your code:

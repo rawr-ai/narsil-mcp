@@ -9,6 +9,54 @@
 
 A Rust-powered MCP (Model Context Protocol) server providing AI assistants with deep code understanding through 90 specialized tools.
 
+## Fork (rawr-ai)
+
+This is a fork of https://github.com/postrv/narsil-mcp.
+
+High-level changes in this fork:
+- Add bounded MCP-over-HTTP sessions for shared, domain-scoped daemons.
+- Warm-start persisted indexes by rebuilding volatile search structures and reconciling them with disk.
+- Give configured roots stable IDs and route nested repositories to their most-specific owner.
+- Harden watch mode against startup races, ignored build output, duplicate content events, and unnecessary persistence writes.
+
+Fork maintenance model (Codex-style):
+- `origin` is the fork (rawr-ai)
+- `upstream` is the upstream project (postrv), fetch-only
+- `main` is a pure mirror of `upstream/main`
+- `codex/integration-upstream-main` is the long-lived shipping branch (fork patches on top of upstream)
+
+Keeping the fork in sync with upstream (high-level):
+```bash
+# 1) Update mirror branch (no fork-only commits on main)
+git fetch upstream
+git checkout main
+git reset --hard upstream/main
+git push --force-with-lease origin main
+
+# 2) Rebase the queue only when it applies cleanly; otherwise rebuild it semantically
+git checkout codex/integration-upstream-main
+git rebase main
+
+# 3) Run tests, then push shipping branch
+git push --force-with-lease origin codex/integration-upstream-main
+```
+
+Do not resolve broad conflicts in indexing, persistence, search, or watcher code by
+mechanically choosing either side. First prove the new upstream baseline, then
+reapply the fork capabilities as a small reviewed patch queue and compare the
+result with the previous shipping range. See the
+[fork maintenance playbook](docs/playbooks/operations/narsil-maintenance/05-fork-rebase-maintenance.md).
+
+Rebuilding (including embedded visualization UI):
+```bash
+cd frontend
+npm ci
+npm run build
+
+cd ..
+cargo build --release --features frontend
+```
+
 ## Why narsil-mcp?
 
 | Feature | narsil-mcp | XRAY | Serena | GitHub MCP |
@@ -249,8 +297,8 @@ narsil-mcp \
   --remote \        # Enable GitHub remote repo support
   --neural \        # Enable neural semantic embeddings
   --neural-backend api \  # Backend: "api" (Voyage/OpenAI) or "onnx"
-  --neural-model voyage-code-2 \  # Model to use
-  --neural-dimension 3072 \  # Override embedding dimensions (auto-detected per model)
+  --neural-model voyage-code-3 \  # Model to use
+  --neural-dimension 1024 \  # Override embedding dimensions (auto-detected per model)
   --graph           # Enable SPARQL/RDF knowledge graph and CCG tools (requires --features graph build)
 ```
 
@@ -428,7 +476,14 @@ narsil-mcp config profiles
 
 ### Visualization Frontend
 
-Explore call graphs, imports, symbol references, and control flow interactively in your browser.
+narsil-mcp includes an optional web-based visualization frontend for exploring call graphs, import dependencies, and code structure interactively.
+
+`--http` starts the visualization/API server.
+`--mcp-http` starts MCP protocol over HTTP (for shared daemon clients).
+
+**Option 1: Embedded Frontend (Recommended)**
+
+Build with the `frontend` feature to embed the visualization UI in the binary:
 
 ```bash
 # Build with embedded frontend
@@ -471,10 +526,12 @@ narsil-mcp config init --neural
 
 # Or manually with Voyage AI
 export VOYAGE_API_KEY="your-key"
-narsil-mcp --repos ~/project --neural --neural-model voyage-code-2
+narsil-mcp --repos ~/project --neural --neural-model voyage-code-3
 ```
 
 Supports Voyage AI, OpenAI, custom endpoints, and local ONNX models.
+Changing the neural model or embedding dimension requires reindexing so stored
+embeddings are rebuilt with the new vector shape.
 
 > **Full documentation:** See [docs/neural-search.md](docs/neural-search.md) for setup, backends, and use cases.
 
@@ -675,6 +732,83 @@ Ralph gracefully degrades when narsil-mcp is unavailable - all core automation f
 
 > **Documentation:** See [Ralph README](https://github.com/postrv/ralphing-la-vida-locum) for full integration details.
 
+### Shared Daemon Mode (Codex / URL Transport)
+
+For lower memory usage across multiple sessions, run shared daemons and connect clients by URL instead of spawning a new stdio process per session.
+
+To keep domains isolated (especially for neural search), run one daemon **per domain** (each daemon can still index multiple roots via `--repos`).
+
+Codex URL transport does not inject per-server env vars, so daemon credentials must come from daemon startup (not from Codex MCP server env blocks). Use `~/.config/narsil-mcp/daemon.env`.
+
+Codex config (`~/.codex-rawr/config.toml`) (one per domain):
+
+```toml
+[mcp_servers.narsil-domain-a]
+url = "http://127.0.0.1:12006/mcp"
+startup_timeout_sec = 120
+
+[mcp_servers.narsil-domain-b]
+url = "http://127.0.0.1:12007/mcp"
+startup_timeout_sec = 120
+```
+
+Important:
+- Do not keep `command = "...narsil-mcp"` MCP entries in Codex config if you want shared daemon mode.
+- Command-based entries spawn per-session stdio processes and can reintroduce OOM pressure.
+- Keep daemon credentials in `~/.config/narsil-mcp/daemon.env` and launch via scripts below.
+
+Quickstart (macOS launchd):
+
+```bash
+# 1) Create daemon credential file
+./scripts/setup-daemon-env.sh --provider voyage --key 'pa-...'
+
+# 2) Configure launcher (single source of truth)
+cp ./configs/launcher.example.toml ~/.config/narsil-mcp/launcher.toml
+$EDITOR ~/.config/narsil-mcp/launcher.toml
+# Optional: set default_neural_model = "voyage-code-3" or per-instance neural_model.
+
+# 3) Apply config (generates plists/wrappers; loads services)
+./scripts/launcherctl.py apply
+
+# 4) Clean restart
+./scripts/launcherctl.py restart
+
+# 5) Validate runtime + config contract
+./scripts/launcherctl.py status
+./scripts/doctor-daemon.sh
+```
+
+`install-launchd.sh` writes (per instance):
+- `~/Library/LaunchAgents/<label>.plist`
+- `<index_path>/launchd-wrapper.sh` (launchd-safe startup wrapper)
+
+See:
+
+- [Codex Shared Daemon Playbook](docs/playbooks/integrations/codex-daemon.md)
+- [Narsil Maintainer Runbooks](docs/playbooks/operations/narsil-maintenance/README.md)
+- [Docker Daemon (Optional)](docs/playbooks/integrations/docker-daemon.md)
+
+Operator commands:
+
+```bash
+# Service lifecycle
+./scripts/launcherctl.py status
+./scripts/launcherctl.py stop
+./scripts/launcherctl.py restart
+./scripts/doctor-daemon.sh
+```
+
+Persistent macOS daemon (launchd, recommended):
+
+```bash
+# install/update/reconcile all configured instances
+./scripts/launcherctl.py apply
+
+# inspect configured instances + endpoint health
+./scripts/launcherctl.py status
+```
+
 ### Playbooks & Tutorials
 
 See **[docs/playbooks](docs/playbooks/)** for practical usage guides:
@@ -714,7 +848,7 @@ const symbols = client.findSymbols('Handler');
 
 | Tool | Description |
 |------|-------------|
-| `list_repos` | List all indexed repositories with metadata |
+| `list_repos` | List indexed repositories with stable repo IDs and metadata |
 | `get_project_structure` | Get directory tree with file icons and sizes |
 | `get_file` | Get file contents with optional line range |
 | `get_excerpt` | Extract code around specific lines with context |
