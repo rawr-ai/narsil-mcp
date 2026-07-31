@@ -615,7 +615,7 @@ mod tests {
         assert_eq!(json["sessions"]["active"], 1);
         assert_eq!(json["sessions"]["max"], 2);
         assert_eq!(json["sessions"]["idle_ttl_seconds"], 1800);
-        assert!(json.to_string().contains("session-1") == false);
+        assert!(!json.to_string().contains("session-1"));
     }
 
     #[test]

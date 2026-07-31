@@ -875,7 +875,7 @@ impl CodeIntelEngine {
             .par_iter()
             .filter_map(|(file_path, relative_path, content)| {
                 let parse_start = std::time::Instant::now();
-                let parsed = self.parser.parse_file(file_path, &content).ok()?;
+                let parsed = self.parser.parse_file(file_path, content).ok()?;
                 metrics.record_file_parse(parse_start.elapsed());
                 Some((
                     file_path.clone(),
